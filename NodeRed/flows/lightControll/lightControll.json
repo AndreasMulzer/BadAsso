@@ -1,0 +1,1778 @@
+[
+    {
+        "id": "57353fb1ead59d3e",
+        "type": "tab",
+        "label": "Licht – RGB-Nachtmodus 60s + Alles AUS",
+        "disabled": false,
+        "info": "Ersetzt den alten Tab Licht neu. Benutzt bestehendes flow.lights im file Store; keine Konfiguration wird beim Deploy überschrieben."
+    },
+    {
+        "id": "99cef3b690e02c7e",
+        "type": "change",
+        "z": "57353fb1ead59d3e",
+        "name": "innen",
+        "rules": [
+            {
+                "t": "set",
+                "p": "area",
+                "pt": "msg",
+                "to": "innen",
+                "tot": "str"
+            }
+        ],
+        "x": 440,
+        "y": 220,
+        "wires": [
+            [
+                "ae8c18b6353106a0"
+            ]
+        ]
+    },
+    {
+        "id": "ae8c18b6353106a0",
+        "type": "function",
+        "z": "57353fb1ead59d3e",
+        "name": "Lichtsteuerung innen",
+        "func": "// Lichtsteuerung: sieben Gruppen, nur innen/aussen sind RGB-Nachtmodusfaehig.\n// Context: flow.lights im Store \"file\". status.channels = letzte kommandierte Ziele.\nconst STORE = \"file\";\nconst root = flow.get(\"lights\", STORE);\nif (!root || typeof root !== \"object\" || !root.config) {\n    node.error(\"flow.lights.config fehlt im Store file: zuerst manuell initialisieren\", msg);\n    return null;\n}\nconst config = root.config;\nconst area = String(msg.area || \"\").trim();\nconst topic = String(msg.topic || \"\").toLowerCase();\nconst areaCfg = config[area];\nconst group = areaCfg?.[\"config group\"];\nif (!group || !Array.isArray(group[\"config segments\"])) {\n    node.error(\"Unbekannte Lichtgruppe: \" + area, msg);\n    return null;\n}\nroot.status = root.status || {};\nroot.status.channels = root.status.channels || {};\nconst values = root.status.channels;\nconst nm = flow.get(\"nightMode\", STORE) || {};\n// Migration: bisherige Sollwerte einmalig in den Nachtmodus-Context verschieben.\n// Vorhandene Backupwerte haben Vorrang; alte Werte nur ergaenzen.\nnm.ChannelBackupPreNightMode = nm.ChannelBackupPreNightMode || {};\nif (root.desiredChannels && typeof root.desiredChannels === \"object\") {\n    for (const [channel, value] of Object.entries(root.desiredChannels)) {\n        if (nm.ChannelBackupPreNightMode[channel] === undefined) {\n            nm.ChannelBackupPreNightMode[channel] = value;\n        }\n    }\n    delete root.desiredChannels;\n}\nconst desired = nm.ChannelBackupPreNightMode;\nconst isRgb = group.type === \"rgb\" && (area === \"innen\" || area === \"aussen\");\nconst nightActive = isRgb && (topic === \"night_apply\" ? msg.payload?.night === true : nm.active === true);\nconst colors = [\"r\", \"g\", \"b\", \"w\", \"ww\"];\nconst clamp = (v, lo = 0, hi = 100) => Math.max(lo, Math.min(hi, Number(v) || 0));\nconst all = new Map();\nfor (const segment of group[\"config segments\"]) {\n    for (const color of colors) {\n        const c = segment.channels?.[color];\n        if (!c || c.channel === null || c.channel === undefined || c.channel === \"\") continue;\n        const channel = Number(c.channel);\n        if (!Number.isInteger(channel)) continue;\n        const delay = Math.max(0, Number(c[\"on delay\"]) || 0);\n        const old = all.get(channel);\n        if (!old || delay >= old.delay) {\n            all.set(channel, { ...c, channel, color, delay });\n        }\n    }\n}\n// Beim Upgrade der bestehenden Installation Sollwerte aus gespeicherten Kanalwerten uebernehmen.\nfor (const n of all.keys()) {\n    if (desired[n] === undefined && values[n] !== undefined) desired[n] = Number(values[n]) || 0;\n}\nfunction groupState(name) {\n    const segs = config[name]?.[\"config group\"]?.[\"config segments\"];\n    if (!Array.isArray(segs)) return \"unknown\";\n    let known = 0, total = 0, active = false;\n    for (const seg of segs) for (const ch of Object.values(seg.channels || {})) {\n        if (ch?.channel === null || ch?.channel === undefined || ch.channel === \"\") continue;\n        total++;\n        const v = values[ch.channel];\n        if (v !== undefined && v !== null) {\n            known++;\n            if (Number(v) > 0) active = true;\n        }\n    }\n    return active ? \"on\" : (total > 0 && known === total ? \"off\" : \"unknown\");\n}\nfunction refreshStates() {\n    for (const name of [\"innen\", \"aussen\", \"position\", \"achtern\", \"top\", \"mast\", \"unterwasser\"]) {\n        if (config[name]) config[name].status = groupState(name);\n    }\n}\nfunction ledMsg() {\n    const s = groupState(area);\n    return { area, topic: \"state\", payload: s === \"on\" ? \"ein\" : s === \"off\" ? \"aus\" : \"unbekannt\" };\n}\nif (topic === \"refresh\") {\n    refreshStates();\n    flow.set(\"nightMode\", nm, STORE);\n    flow.set(\"lights\", root, STORE);\n    return [null, ledMsg()];\n}\nif (![\"toggle\", \"slider\", \"color\", \"colour\", \"rgb\", \"off\", \"alloff\", \"night_apply\"].includes(topic)) {\n    node.error(\"Unbekanntes Topic: \" + topic, msg);\n    return null;\n}\nif (topic === \"night_apply\" && !isRgb) return null;\n// Gruppenstatus bestimmt Alles-AUS, nicht der letzte Bedienmodus.\nconst desiredOn = [...all.keys()].some(n => Number(desired[n] || 0) > 0);\nif (topic === \"alloff\" && !desiredOn && groupState(area) === \"off\") {\n    refreshStates();\n    flow.set(\"nightMode\", nm, STORE);\n    flow.set(\"lights\", root, STORE);\n    return [null, ledMsg()];\n}\nconst turnOn = topic === \"toggle\" && !desiredOn;\nconst normalCommand = topic !== \"night_apply\";\nconst shuttingDown = topic === \"off\" || topic === \"alloff\" || (topic === \"toggle\" && !turnOn);\nconst baseFade = Number(group[\"fade speed\"]) || 0;\nconst transitionFade = Math.max(0, Number(msg.payload?.fadeMs) || 0);\nconst commands = new Map();\n\n// Neue Sollwerte errechnen, bevor die Nachtmodus-Maske auf sie angewandt wird.\nif (normalCommand) {\n    for (const ch of all.values()) {\n        const maxbright = clamp(ch.maxbright ?? 100);\n        let v = 0;\n        if (topic === \"toggle\") {\n            if (turnOn) v = Math.min(clamp(ch[\"auto brightness\"] ?? maxbright), maxbright);\n        } else if (topic === \"slider\") {\n            let minVal = clamp(ch.min_val ?? 0);\n            let maxVal = clamp(ch.max_val ?? ch.maxbright ?? 100);\n            if (maxVal < minVal) [minVal, maxVal] = [maxVal, minVal];\n            v = minVal + (maxVal - minVal) * clamp(msg.payload) / 100;\n        } else if ([\"color\", \"colour\", \"rgb\"].includes(topic)) {\n            const p = msg.payload && typeof msg.payload === \"object\" ? msg.payload : {};\n            v = Math.min(clamp(p[ch.color] ?? 0), maxbright);\n        }\n        desired[ch.channel] = v;\n    }\n}\nconst wantOn = [...all.keys()].some(n => Number(desired[n] || 0) > 0);\n// Funktioniert auch bei reiner G/B-Farbwahl: nachts rote Grundbeleuchtung einschalten.\nfunction physicalValue(ch) {\n    const requested = clamp(desired[ch.channel] ?? 0);\n    if (!nightActive || !wantOn) return requested;\n    if (ch.color === \"g\" || ch.color === \"b\") return 0;\n    if (ch.color === \"r\" && requested <= 0) {\n        return Math.min(clamp(ch[\"auto brightness\"] ?? ch.maxbright ?? 100), clamp(ch.maxbright ?? 100));\n    }\n    return requested;\n}\n// Ein- oder Ausschaltbefehle der normalen Gruppensteuerung behalten ihre Verzoegerungen.\nfor (const ch of all.values()) {\n    const output = physicalValue(ch);\n    const previous = values[ch.channel];\n    let delay = 0, fadeMs = 0;\n    if (topic === \"toggle\" || topic === \"alloff\") {\n        fadeMs = baseFade;\n        delay = shuttingDown ? Math.max(0, Number(ch[\"off delay\"]) || 0) : ch.delay;\n    } else if (topic === \"night_apply\") {\n        // Nur geaenderte Ausgangsziele werden ueberblendet; rote Kanaele bleiben sonst unangetastet.\n        fadeMs = (ch.color === \"g\" || ch.color === \"b\") ? transitionFade : Math.min(1000, transitionFade);\n    }\n    if (topic !== \"night_apply\" || previous === undefined || Math.abs(Number(previous) - output) > 0.00001) {\n        commands.set(ch.channel, { channel: ch.channel, value: output, fadeMs, delay });\n    }\n}\n// Vorhandene Einschalt-Timer bei einem neuen Gruppenbefehl loeschen.\n// Noch nicht abgeschickte Kanaele muessen bei night_apply neu ausgegeben werden.\nconst oldPending = context.get(\"pendingTimers\") || [];\nif (topic === \"night_apply\") {\n    for (const pending of oldPending) {\n        for (const n of pending.channels || []) {\n            if (!commands.has(n) && all.has(n)) {\n                const ch = all.get(n);\n                commands.set(n, {\n                    channel: n, value: physicalValue(ch),\n                    fadeMs: ch.color === \"g\" || ch.color === \"b\" ? transitionFade : baseFade,\n                    delay: 0\n                });\n            }\n        }\n    }\n}\nfor (const pending of oldPending) clearTimeout(pending.timer || pending);\ncontext.set(\"pendingTimers\", []);\nfor (const command of commands.values()) values[command.channel] = command.value;\nrefreshStates();\nif (normalCommand) {\n    const state = groupState(area);\n    areaCfg.mode = state === \"off\" ? \"off\" :\n        topic === \"toggle\" ? \"toggle\" :\n        topic === \"slider\" ? \"slider\" :\n        [\"color\", \"colour\", \"rgb\"].includes(topic) ? \"colour\" : \"off\";\n}\nflow.set(\"nightMode\", nm, STORE);\nflow.set(\"lights\", root, STORE);\nnode.send([null, ledMsg()]);\nconst byDelay = new Map();\nfor (const item of commands.values()) {\n    if (!byDelay.has(item.delay)) byDelay.set(item.delay, []);\n    byDelay.get(item.delay).push({ channel: item.channel, value: item.value, fadeMs: item.fadeMs });\n}\nconst timers = [];\nfor (const [delay, items] of byDelay) {\n    const out = { area, payload: { type: \"set_multi\", items } };\n    if (delay > 0) {\n        const t = setTimeout(() => {\n            const remaining = (context.get(\"pendingTimers\") || []).filter(p => p.timer !== t);\n            context.set(\"pendingTimers\", remaining);\n            node.send([out, null]);\n        }, delay);\n        timers.push({timer:t, channels:items.map(x=>x.channel)});\n    } else node.send([out, null]);\n}\ncontext.set(\"pendingTimers\", timers);\nreturn null;\n",
+        "outputs": 2,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 650,
+        "y": 220,
+        "wires": [
+            [
+                "4b185ddb86d7b943",
+                "ce934d58b844946f"
+            ],
+            [
+                "18e2b2553bc9c750"
+            ]
+        ]
+    },
+    {
+        "id": "4b185ddb86d7b943",
+        "type": "link out",
+        "z": "57353fb1ead59d3e",
+        "name": "ESP innen",
+        "mode": "link",
+        "links": [
+            "33a6f0e4f10ef706"
+        ],
+        "x": 890,
+        "y": 200,
+        "wires": []
+    },
+    {
+        "id": "18e2b2553bc9c750",
+        "type": "ui_led",
+        "z": "57353fb1ead59d3e",
+        "name": "Innen",
+        "group": "afcacc8ef8574799",
+        "order": 4,
+        "width": 1,
+        "height": 1,
+        "label": "",
+        "labelPlacement": "left",
+        "labelAlignment": "left",
+        "colorForValue": [
+            {
+                "color": "#808080",
+                "value": "aus",
+                "valueType": "str"
+            },
+            {
+                "color": "#008000",
+                "value": "ein",
+                "valueType": "str"
+            },
+            {
+                "color": "#FFA500",
+                "value": "unbekannt",
+                "valueType": "str"
+            }
+        ],
+        "allowColorForValueInMessage": false,
+        "shape": "circle",
+        "showGlow": true,
+        "x": 900,
+        "y": 255,
+        "wires": []
+    },
+    {
+        "id": "39e7a634635cfbbb",
+        "type": "ui_button",
+        "z": "57353fb1ead59d3e",
+        "name": "",
+        "group": "afcacc8ef8574799",
+        "order": 1,
+        "width": 2,
+        "height": 1,
+        "passthru": false,
+        "label": "Innen",
+        "tooltip": "",
+        "color": "",
+        "bgcolor": "",
+        "className": "",
+        "icon": "fa-lightbulb-o",
+        "payload": "1",
+        "payloadType": "num",
+        "topic": "toggle",
+        "topicType": "str",
+        "x": 190,
+        "y": 180,
+        "wires": [
+            [
+                "99cef3b690e02c7e"
+            ]
+        ]
+    },
+    {
+        "id": "f4a9b8c99fe2ad37",
+        "type": "ui_slider",
+        "z": "57353fb1ead59d3e",
+        "name": "Innen",
+        "label": "",
+        "tooltip": "",
+        "group": "afcacc8ef8574799",
+        "order": 2,
+        "width": 5,
+        "height": 1,
+        "passthru": true,
+        "outs": "all",
+        "topic": "slider",
+        "topicType": "str",
+        "min": 0,
+        "max": "100",
+        "step": 1,
+        "className": "",
+        "x": 190,
+        "y": 220,
+        "wires": [
+            [
+                "99cef3b690e02c7e"
+            ]
+        ]
+    },
+    {
+        "id": "780650806ecbb79f",
+        "type": "ui_colour_picker",
+        "z": "57353fb1ead59d3e",
+        "name": "Innen",
+        "label": "",
+        "group": "afcacc8ef8574799",
+        "format": "rgb",
+        "outformat": "object",
+        "showSwatch": true,
+        "showPicker": false,
+        "showValue": false,
+        "showHue": false,
+        "showAlpha": false,
+        "showLightness": true,
+        "square": "false",
+        "dynOutput": "false",
+        "order": 3,
+        "width": 1,
+        "height": 1,
+        "passthru": true,
+        "topic": "color",
+        "topicType": "str",
+        "className": "",
+        "x": 180,
+        "y": 260,
+        "wires": [
+            [
+                "a8a60f52119d2d85"
+            ]
+        ]
+    },
+    {
+        "id": "a8a60f52119d2d85",
+        "type": "function",
+        "z": "57353fb1ead59d3e",
+        "name": "RGB 0–255 → 0–100",
+        "func": "const p=msg.payload || {}; msg.payload={r:(Number(p.r)||0)/255*100,g:(Number(p.g)||0)/255*100,b:(Number(p.b)||0)/255*100}; return msg;",
+        "outputs": 1,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 350,
+        "y": 265,
+        "wires": [
+            [
+                "99cef3b690e02c7e"
+            ]
+        ]
+    },
+    {
+        "id": "153af5322b63508f",
+        "type": "change",
+        "z": "57353fb1ead59d3e",
+        "name": "aussen",
+        "rules": [
+            {
+                "t": "set",
+                "p": "area",
+                "pt": "msg",
+                "to": "aussen",
+                "tot": "str"
+            }
+        ],
+        "x": 440,
+        "y": 400,
+        "wires": [
+            [
+                "3f8a2d6c4825b1c6"
+            ]
+        ]
+    },
+    {
+        "id": "3f8a2d6c4825b1c6",
+        "type": "function",
+        "z": "57353fb1ead59d3e",
+        "name": "Lichtsteuerung aussen",
+        "func": "// Lichtsteuerung: sieben Gruppen, nur innen/aussen sind RGB-Nachtmodusfaehig.\n// Context: flow.lights im Store \"file\". status.channels = letzte kommandierte Ziele.\nconst STORE = \"file\";\nconst root = flow.get(\"lights\", STORE);\nif (!root || typeof root !== \"object\" || !root.config) {\n    node.error(\"flow.lights.config fehlt im Store file: zuerst manuell initialisieren\", msg);\n    return null;\n}\nconst config = root.config;\nconst area = String(msg.area || \"\").trim();\nconst topic = String(msg.topic || \"\").toLowerCase();\nconst areaCfg = config[area];\nconst group = areaCfg?.[\"config group\"];\nif (!group || !Array.isArray(group[\"config segments\"])) {\n    node.error(\"Unbekannte Lichtgruppe: \" + area, msg);\n    return null;\n}\nroot.status = root.status || {};\nroot.status.channels = root.status.channels || {};\nconst values = root.status.channels;\nconst nm = flow.get(\"nightMode\", STORE) || {};\n// Migration: bisherige Sollwerte einmalig in den Nachtmodus-Context verschieben.\n// Vorhandene Backupwerte haben Vorrang; alte Werte nur ergaenzen.\nnm.ChannelBackupPreNightMode = nm.ChannelBackupPreNightMode || {};\nif (root.desiredChannels && typeof root.desiredChannels === \"object\") {\n    for (const [channel, value] of Object.entries(root.desiredChannels)) {\n        if (nm.ChannelBackupPreNightMode[channel] === undefined) {\n            nm.ChannelBackupPreNightMode[channel] = value;\n        }\n    }\n    delete root.desiredChannels;\n}\nconst desired = nm.ChannelBackupPreNightMode;\nconst isRgb = group.type === \"rgb\" && (area === \"innen\" || area === \"aussen\");\nconst nightActive = isRgb && (topic === \"night_apply\" ? msg.payload?.night === true : nm.active === true);\nconst colors = [\"r\", \"g\", \"b\", \"w\", \"ww\"];\nconst clamp = (v, lo = 0, hi = 100) => Math.max(lo, Math.min(hi, Number(v) || 0));\nconst all = new Map();\nfor (const segment of group[\"config segments\"]) {\n    for (const color of colors) {\n        const c = segment.channels?.[color];\n        if (!c || c.channel === null || c.channel === undefined || c.channel === \"\") continue;\n        const channel = Number(c.channel);\n        if (!Number.isInteger(channel)) continue;\n        const delay = Math.max(0, Number(c[\"on delay\"]) || 0);\n        const old = all.get(channel);\n        if (!old || delay >= old.delay) {\n            all.set(channel, { ...c, channel, color, delay });\n        }\n    }\n}\n// Beim Upgrade der bestehenden Installation Sollwerte aus gespeicherten Kanalwerten uebernehmen.\nfor (const n of all.keys()) {\n    if (desired[n] === undefined && values[n] !== undefined) desired[n] = Number(values[n]) || 0;\n}\nfunction groupState(name) {\n    const segs = config[name]?.[\"config group\"]?.[\"config segments\"];\n    if (!Array.isArray(segs)) return \"unknown\";\n    let known = 0, total = 0, active = false;\n    for (const seg of segs) for (const ch of Object.values(seg.channels || {})) {\n        if (ch?.channel === null || ch?.channel === undefined || ch.channel === \"\") continue;\n        total++;\n        const v = values[ch.channel];\n        if (v !== undefined && v !== null) {\n            known++;\n            if (Number(v) > 0) active = true;\n        }\n    }\n    return active ? \"on\" : (total > 0 && known === total ? \"off\" : \"unknown\");\n}\nfunction refreshStates() {\n    for (const name of [\"innen\", \"aussen\", \"position\", \"achtern\", \"top\", \"mast\", \"unterwasser\"]) {\n        if (config[name]) config[name].status = groupState(name);\n    }\n}\nfunction ledMsg() {\n    const s = groupState(area);\n    return { area, topic: \"state\", payload: s === \"on\" ? \"ein\" : s === \"off\" ? \"aus\" : \"unbekannt\" };\n}\nif (topic === \"refresh\") {\n    refreshStates();\n    flow.set(\"nightMode\", nm, STORE);\n    flow.set(\"lights\", root, STORE);\n    return [null, ledMsg()];\n}\nif (![\"toggle\", \"slider\", \"color\", \"colour\", \"rgb\", \"off\", \"alloff\", \"night_apply\"].includes(topic)) {\n    node.error(\"Unbekanntes Topic: \" + topic, msg);\n    return null;\n}\nif (topic === \"night_apply\" && !isRgb) return null;\n// Gruppenstatus bestimmt Alles-AUS, nicht der letzte Bedienmodus.\nconst desiredOn = [...all.keys()].some(n => Number(desired[n] || 0) > 0);\nif (topic === \"alloff\" && !desiredOn && groupState(area) === \"off\") {\n    refreshStates();\n    flow.set(\"nightMode\", nm, STORE);\n    flow.set(\"lights\", root, STORE);\n    return [null, ledMsg()];\n}\nconst turnOn = topic === \"toggle\" && !desiredOn;\nconst normalCommand = topic !== \"night_apply\";\nconst shuttingDown = topic === \"off\" || topic === \"alloff\" || (topic === \"toggle\" && !turnOn);\nconst baseFade = Number(group[\"fade speed\"]) || 0;\nconst transitionFade = Math.max(0, Number(msg.payload?.fadeMs) || 0);\nconst commands = new Map();\n\n// Neue Sollwerte errechnen, bevor die Nachtmodus-Maske auf sie angewandt wird.\nif (normalCommand) {\n    for (const ch of all.values()) {\n        const maxbright = clamp(ch.maxbright ?? 100);\n        let v = 0;\n        if (topic === \"toggle\") {\n            if (turnOn) v = Math.min(clamp(ch[\"auto brightness\"] ?? maxbright), maxbright);\n        } else if (topic === \"slider\") {\n            let minVal = clamp(ch.min_val ?? 0);\n            let maxVal = clamp(ch.max_val ?? ch.maxbright ?? 100);\n            if (maxVal < minVal) [minVal, maxVal] = [maxVal, minVal];\n            v = minVal + (maxVal - minVal) * clamp(msg.payload) / 100;\n        } else if ([\"color\", \"colour\", \"rgb\"].includes(topic)) {\n            const p = msg.payload && typeof msg.payload === \"object\" ? msg.payload : {};\n            v = Math.min(clamp(p[ch.color] ?? 0), maxbright);\n        }\n        desired[ch.channel] = v;\n    }\n}\nconst wantOn = [...all.keys()].some(n => Number(desired[n] || 0) > 0);\n// Funktioniert auch bei reiner G/B-Farbwahl: nachts rote Grundbeleuchtung einschalten.\nfunction physicalValue(ch) {\n    const requested = clamp(desired[ch.channel] ?? 0);\n    if (!nightActive || !wantOn) return requested;\n    if (ch.color === \"g\" || ch.color === \"b\") return 0;\n    if (ch.color === \"r\" && requested <= 0) {\n        return Math.min(clamp(ch[\"auto brightness\"] ?? ch.maxbright ?? 100), clamp(ch.maxbright ?? 100));\n    }\n    return requested;\n}\n// Ein- oder Ausschaltbefehle der normalen Gruppensteuerung behalten ihre Verzoegerungen.\nfor (const ch of all.values()) {\n    const output = physicalValue(ch);\n    const previous = values[ch.channel];\n    let delay = 0, fadeMs = 0;\n    if (topic === \"toggle\" || topic === \"alloff\") {\n        fadeMs = baseFade;\n        delay = shuttingDown ? Math.max(0, Number(ch[\"off delay\"]) || 0) : ch.delay;\n    } else if (topic === \"night_apply\") {\n        // Nur geaenderte Ausgangsziele werden ueberblendet; rote Kanaele bleiben sonst unangetastet.\n        fadeMs = (ch.color === \"g\" || ch.color === \"b\") ? transitionFade : Math.min(1000, transitionFade);\n    }\n    if (topic !== \"night_apply\" || previous === undefined || Math.abs(Number(previous) - output) > 0.00001) {\n        commands.set(ch.channel, { channel: ch.channel, value: output, fadeMs, delay });\n    }\n}\n// Vorhandene Einschalt-Timer bei einem neuen Gruppenbefehl loeschen.\n// Noch nicht abgeschickte Kanaele muessen bei night_apply neu ausgegeben werden.\nconst oldPending = context.get(\"pendingTimers\") || [];\nif (topic === \"night_apply\") {\n    for (const pending of oldPending) {\n        for (const n of pending.channels || []) {\n            if (!commands.has(n) && all.has(n)) {\n                const ch = all.get(n);\n                commands.set(n, {\n                    channel: n, value: physicalValue(ch),\n                    fadeMs: ch.color === \"g\" || ch.color === \"b\" ? transitionFade : baseFade,\n                    delay: 0\n                });\n            }\n        }\n    }\n}\nfor (const pending of oldPending) clearTimeout(pending.timer || pending);\ncontext.set(\"pendingTimers\", []);\nfor (const command of commands.values()) values[command.channel] = command.value;\nrefreshStates();\nif (normalCommand) {\n    const state = groupState(area);\n    areaCfg.mode = state === \"off\" ? \"off\" :\n        topic === \"toggle\" ? \"toggle\" :\n        topic === \"slider\" ? \"slider\" :\n        [\"color\", \"colour\", \"rgb\"].includes(topic) ? \"colour\" : \"off\";\n}\nflow.set(\"nightMode\", nm, STORE);\nflow.set(\"lights\", root, STORE);\nnode.send([null, ledMsg()]);\nconst byDelay = new Map();\nfor (const item of commands.values()) {\n    if (!byDelay.has(item.delay)) byDelay.set(item.delay, []);\n    byDelay.get(item.delay).push({ channel: item.channel, value: item.value, fadeMs: item.fadeMs });\n}\nconst timers = [];\nfor (const [delay, items] of byDelay) {\n    const out = { area, payload: { type: \"set_multi\", items } };\n    if (delay > 0) {\n        const t = setTimeout(() => {\n            const remaining = (context.get(\"pendingTimers\") || []).filter(p => p.timer !== t);\n            context.set(\"pendingTimers\", remaining);\n            node.send([out, null]);\n        }, delay);\n        timers.push({timer:t, channels:items.map(x=>x.channel)});\n    } else node.send([out, null]);\n}\ncontext.set(\"pendingTimers\", timers);\nreturn null;\n",
+        "outputs": 2,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 650,
+        "y": 400,
+        "wires": [
+            [
+                "6576565b753d2ce4"
+            ],
+            [
+                "36e065e764ca370b"
+            ]
+        ]
+    },
+    {
+        "id": "6576565b753d2ce4",
+        "type": "link out",
+        "z": "57353fb1ead59d3e",
+        "name": "ESP aussen",
+        "mode": "link",
+        "links": [
+            "33a6f0e4f10ef706"
+        ],
+        "x": 890,
+        "y": 380,
+        "wires": []
+    },
+    {
+        "id": "36e065e764ca370b",
+        "type": "ui_led",
+        "z": "57353fb1ead59d3e",
+        "name": "Außen",
+        "group": "afcacc8ef8574799",
+        "order": 8,
+        "width": 1,
+        "height": 1,
+        "label": "",
+        "labelPlacement": "left",
+        "labelAlignment": "left",
+        "colorForValue": [
+            {
+                "color": "#808080",
+                "value": "aus",
+                "valueType": "str"
+            },
+            {
+                "color": "#008000",
+                "value": "ein",
+                "valueType": "str"
+            },
+            {
+                "color": "#FFA500",
+                "value": "unbekannt",
+                "valueType": "str"
+            }
+        ],
+        "allowColorForValueInMessage": false,
+        "shape": "circle",
+        "showGlow": true,
+        "x": 900,
+        "y": 435,
+        "wires": []
+    },
+    {
+        "id": "50ec07ed196aeeb8",
+        "type": "ui_button",
+        "z": "57353fb1ead59d3e",
+        "name": "",
+        "group": "afcacc8ef8574799",
+        "order": 5,
+        "width": 2,
+        "height": 1,
+        "passthru": false,
+        "label": "Außen",
+        "tooltip": "",
+        "color": "",
+        "bgcolor": "",
+        "className": "",
+        "icon": "fa-lightbulb-o",
+        "payload": "1",
+        "payloadType": "num",
+        "topic": "toggle",
+        "topicType": "str",
+        "x": 190,
+        "y": 360,
+        "wires": [
+            [
+                "153af5322b63508f"
+            ]
+        ]
+    },
+    {
+        "id": "0fe2fc6bbba8bbb9",
+        "type": "ui_slider",
+        "z": "57353fb1ead59d3e",
+        "name": "Außen",
+        "label": "",
+        "tooltip": "",
+        "group": "afcacc8ef8574799",
+        "order": 6,
+        "width": 5,
+        "height": 1,
+        "passthru": true,
+        "outs": "all",
+        "topic": "slider",
+        "topicType": "str",
+        "min": 0,
+        "max": "100",
+        "step": 1,
+        "className": "",
+        "x": 190,
+        "y": 400,
+        "wires": [
+            [
+                "153af5322b63508f"
+            ]
+        ]
+    },
+    {
+        "id": "dc2a73a3748d52b7",
+        "type": "ui_colour_picker",
+        "z": "57353fb1ead59d3e",
+        "name": "Außen",
+        "label": "",
+        "group": "afcacc8ef8574799",
+        "format": "rgb",
+        "outformat": "object",
+        "showSwatch": true,
+        "showPicker": false,
+        "showValue": false,
+        "showHue": false,
+        "showAlpha": false,
+        "showLightness": true,
+        "square": "false",
+        "dynOutput": "false",
+        "order": 7,
+        "width": 1,
+        "height": 1,
+        "passthru": true,
+        "topic": "color",
+        "topicType": "str",
+        "className": "",
+        "x": 180,
+        "y": 440,
+        "wires": [
+            [
+                "8cb52c5742d830a8"
+            ]
+        ]
+    },
+    {
+        "id": "8cb52c5742d830a8",
+        "type": "function",
+        "z": "57353fb1ead59d3e",
+        "name": "RGB 0–255 → 0–100",
+        "func": "const p=msg.payload || {}; msg.payload={r:(Number(p.r)||0)/255*100,g:(Number(p.g)||0)/255*100,b:(Number(p.b)||0)/255*100}; return msg;",
+        "outputs": 1,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 350,
+        "y": 445,
+        "wires": [
+            [
+                "153af5322b63508f"
+            ]
+        ]
+    },
+    {
+        "id": "8cd9cda73b291648",
+        "type": "change",
+        "z": "57353fb1ead59d3e",
+        "name": "position",
+        "rules": [
+            {
+                "t": "set",
+                "p": "area",
+                "pt": "msg",
+                "to": "position",
+                "tot": "str"
+            }
+        ],
+        "x": 440,
+        "y": 580,
+        "wires": [
+            [
+                "358c8606746d5e0a"
+            ]
+        ]
+    },
+    {
+        "id": "358c8606746d5e0a",
+        "type": "function",
+        "z": "57353fb1ead59d3e",
+        "name": "Lichtsteuerung position",
+        "func": "// Lichtsteuerung: sieben Gruppen, nur innen/aussen sind RGB-Nachtmodusfaehig.\n// Context: flow.lights im Store \"file\". status.channels = letzte kommandierte Ziele.\nconst STORE = \"file\";\nconst root = flow.get(\"lights\", STORE);\nif (!root || typeof root !== \"object\" || !root.config) {\n    node.error(\"flow.lights.config fehlt im Store file: zuerst manuell initialisieren\", msg);\n    return null;\n}\nconst config = root.config;\nconst area = String(msg.area || \"\").trim();\nconst topic = String(msg.topic || \"\").toLowerCase();\nconst areaCfg = config[area];\nconst group = areaCfg?.[\"config group\"];\nif (!group || !Array.isArray(group[\"config segments\"])) {\n    node.error(\"Unbekannte Lichtgruppe: \" + area, msg);\n    return null;\n}\nroot.status = root.status || {};\nroot.status.channels = root.status.channels || {};\nconst values = root.status.channels;\nconst nm = flow.get(\"nightMode\", STORE) || {};\n// Migration: bisherige Sollwerte einmalig in den Nachtmodus-Context verschieben.\n// Vorhandene Backupwerte haben Vorrang; alte Werte nur ergaenzen.\nnm.ChannelBackupPreNightMode = nm.ChannelBackupPreNightMode || {};\nif (root.desiredChannels && typeof root.desiredChannels === \"object\") {\n    for (const [channel, value] of Object.entries(root.desiredChannels)) {\n        if (nm.ChannelBackupPreNightMode[channel] === undefined) {\n            nm.ChannelBackupPreNightMode[channel] = value;\n        }\n    }\n    delete root.desiredChannels;\n}\nconst desired = nm.ChannelBackupPreNightMode;\nconst isRgb = group.type === \"rgb\" && (area === \"innen\" || area === \"aussen\");\nconst nightActive = isRgb && (topic === \"night_apply\" ? msg.payload?.night === true : nm.active === true);\nconst colors = [\"r\", \"g\", \"b\", \"w\", \"ww\"];\nconst clamp = (v, lo = 0, hi = 100) => Math.max(lo, Math.min(hi, Number(v) || 0));\nconst all = new Map();\nfor (const segment of group[\"config segments\"]) {\n    for (const color of colors) {\n        const c = segment.channels?.[color];\n        if (!c || c.channel === null || c.channel === undefined || c.channel === \"\") continue;\n        const channel = Number(c.channel);\n        if (!Number.isInteger(channel)) continue;\n        const delay = Math.max(0, Number(c[\"on delay\"]) || 0);\n        const old = all.get(channel);\n        if (!old || delay >= old.delay) {\n            all.set(channel, { ...c, channel, color, delay });\n        }\n    }\n}\n// Beim Upgrade der bestehenden Installation Sollwerte aus gespeicherten Kanalwerten uebernehmen.\nfor (const n of all.keys()) {\n    if (desired[n] === undefined && values[n] !== undefined) desired[n] = Number(values[n]) || 0;\n}\nfunction groupState(name) {\n    const segs = config[name]?.[\"config group\"]?.[\"config segments\"];\n    if (!Array.isArray(segs)) return \"unknown\";\n    let known = 0, total = 0, active = false;\n    for (const seg of segs) for (const ch of Object.values(seg.channels || {})) {\n        if (ch?.channel === null || ch?.channel === undefined || ch.channel === \"\") continue;\n        total++;\n        const v = values[ch.channel];\n        if (v !== undefined && v !== null) {\n            known++;\n            if (Number(v) > 0) active = true;\n        }\n    }\n    return active ? \"on\" : (total > 0 && known === total ? \"off\" : \"unknown\");\n}\nfunction refreshStates() {\n    for (const name of [\"innen\", \"aussen\", \"position\", \"achtern\", \"top\", \"mast\", \"unterwasser\"]) {\n        if (config[name]) config[name].status = groupState(name);\n    }\n}\nfunction ledMsg() {\n    const s = groupState(area);\n    return { area, topic: \"state\", payload: s === \"on\" ? \"ein\" : s === \"off\" ? \"aus\" : \"unbekannt\" };\n}\nif (topic === \"refresh\") {\n    refreshStates();\n    flow.set(\"nightMode\", nm, STORE);\n    flow.set(\"lights\", root, STORE);\n    return [null, ledMsg()];\n}\nif (![\"toggle\", \"slider\", \"color\", \"colour\", \"rgb\", \"off\", \"alloff\", \"night_apply\"].includes(topic)) {\n    node.error(\"Unbekanntes Topic: \" + topic, msg);\n    return null;\n}\nif (topic === \"night_apply\" && !isRgb) return null;\n// Gruppenstatus bestimmt Alles-AUS, nicht der letzte Bedienmodus.\nconst desiredOn = [...all.keys()].some(n => Number(desired[n] || 0) > 0);\nif (topic === \"alloff\" && !desiredOn && groupState(area) === \"off\") {\n    refreshStates();\n    flow.set(\"nightMode\", nm, STORE);\n    flow.set(\"lights\", root, STORE);\n    return [null, ledMsg()];\n}\nconst turnOn = topic === \"toggle\" && !desiredOn;\nconst normalCommand = topic !== \"night_apply\";\nconst shuttingDown = topic === \"off\" || topic === \"alloff\" || (topic === \"toggle\" && !turnOn);\nconst baseFade = Number(group[\"fade speed\"]) || 0;\nconst transitionFade = Math.max(0, Number(msg.payload?.fadeMs) || 0);\nconst commands = new Map();\n\n// Neue Sollwerte errechnen, bevor die Nachtmodus-Maske auf sie angewandt wird.\nif (normalCommand) {\n    for (const ch of all.values()) {\n        const maxbright = clamp(ch.maxbright ?? 100);\n        let v = 0;\n        if (topic === \"toggle\") {\n            if (turnOn) v = Math.min(clamp(ch[\"auto brightness\"] ?? maxbright), maxbright);\n        } else if (topic === \"slider\") {\n            let minVal = clamp(ch.min_val ?? 0);\n            let maxVal = clamp(ch.max_val ?? ch.maxbright ?? 100);\n            if (maxVal < minVal) [minVal, maxVal] = [maxVal, minVal];\n            v = minVal + (maxVal - minVal) * clamp(msg.payload) / 100;\n        } else if ([\"color\", \"colour\", \"rgb\"].includes(topic)) {\n            const p = msg.payload && typeof msg.payload === \"object\" ? msg.payload : {};\n            v = Math.min(clamp(p[ch.color] ?? 0), maxbright);\n        }\n        desired[ch.channel] = v;\n    }\n}\nconst wantOn = [...all.keys()].some(n => Number(desired[n] || 0) > 0);\n// Funktioniert auch bei reiner G/B-Farbwahl: nachts rote Grundbeleuchtung einschalten.\nfunction physicalValue(ch) {\n    const requested = clamp(desired[ch.channel] ?? 0);\n    if (!nightActive || !wantOn) return requested;\n    if (ch.color === \"g\" || ch.color === \"b\") return 0;\n    if (ch.color === \"r\" && requested <= 0) {\n        return Math.min(clamp(ch[\"auto brightness\"] ?? ch.maxbright ?? 100), clamp(ch.maxbright ?? 100));\n    }\n    return requested;\n}\n// Ein- oder Ausschaltbefehle der normalen Gruppensteuerung behalten ihre Verzoegerungen.\nfor (const ch of all.values()) {\n    const output = physicalValue(ch);\n    const previous = values[ch.channel];\n    let delay = 0, fadeMs = 0;\n    if (topic === \"toggle\" || topic === \"alloff\") {\n        fadeMs = baseFade;\n        delay = shuttingDown ? Math.max(0, Number(ch[\"off delay\"]) || 0) : ch.delay;\n    } else if (topic === \"night_apply\") {\n        // Nur geaenderte Ausgangsziele werden ueberblendet; rote Kanaele bleiben sonst unangetastet.\n        fadeMs = (ch.color === \"g\" || ch.color === \"b\") ? transitionFade : Math.min(1000, transitionFade);\n    }\n    if (topic !== \"night_apply\" || previous === undefined || Math.abs(Number(previous) - output) > 0.00001) {\n        commands.set(ch.channel, { channel: ch.channel, value: output, fadeMs, delay });\n    }\n}\n// Vorhandene Einschalt-Timer bei einem neuen Gruppenbefehl loeschen.\n// Noch nicht abgeschickte Kanaele muessen bei night_apply neu ausgegeben werden.\nconst oldPending = context.get(\"pendingTimers\") || [];\nif (topic === \"night_apply\") {\n    for (const pending of oldPending) {\n        for (const n of pending.channels || []) {\n            if (!commands.has(n) && all.has(n)) {\n                const ch = all.get(n);\n                commands.set(n, {\n                    channel: n, value: physicalValue(ch),\n                    fadeMs: ch.color === \"g\" || ch.color === \"b\" ? transitionFade : baseFade,\n                    delay: 0\n                });\n            }\n        }\n    }\n}\nfor (const pending of oldPending) clearTimeout(pending.timer || pending);\ncontext.set(\"pendingTimers\", []);\nfor (const command of commands.values()) values[command.channel] = command.value;\nrefreshStates();\nif (normalCommand) {\n    const state = groupState(area);\n    areaCfg.mode = state === \"off\" ? \"off\" :\n        topic === \"toggle\" ? \"toggle\" :\n        topic === \"slider\" ? \"slider\" :\n        [\"color\", \"colour\", \"rgb\"].includes(topic) ? \"colour\" : \"off\";\n}\nflow.set(\"nightMode\", nm, STORE);\nflow.set(\"lights\", root, STORE);\nnode.send([null, ledMsg()]);\nconst byDelay = new Map();\nfor (const item of commands.values()) {\n    if (!byDelay.has(item.delay)) byDelay.set(item.delay, []);\n    byDelay.get(item.delay).push({ channel: item.channel, value: item.value, fadeMs: item.fadeMs });\n}\nconst timers = [];\nfor (const [delay, items] of byDelay) {\n    const out = { area, payload: { type: \"set_multi\", items } };\n    if (delay > 0) {\n        const t = setTimeout(() => {\n            const remaining = (context.get(\"pendingTimers\") || []).filter(p => p.timer !== t);\n            context.set(\"pendingTimers\", remaining);\n            node.send([out, null]);\n        }, delay);\n        timers.push({timer:t, channels:items.map(x=>x.channel)});\n    } else node.send([out, null]);\n}\ncontext.set(\"pendingTimers\", timers);\nreturn null;\n",
+        "outputs": 2,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 650,
+        "y": 580,
+        "wires": [
+            [
+                "9bfb4289213e9d80"
+            ],
+            [
+                "0211a62503a823ae"
+            ]
+        ]
+    },
+    {
+        "id": "9bfb4289213e9d80",
+        "type": "link out",
+        "z": "57353fb1ead59d3e",
+        "name": "ESP position",
+        "mode": "link",
+        "links": [
+            "d884558431ecd46d"
+        ],
+        "x": 890,
+        "y": 560,
+        "wires": []
+    },
+    {
+        "id": "0211a62503a823ae",
+        "type": "ui_led",
+        "z": "57353fb1ead59d3e",
+        "name": "Positionslichter",
+        "group": "afcacc8ef8574799",
+        "order": 12,
+        "width": 1,
+        "height": 1,
+        "label": "",
+        "labelPlacement": "left",
+        "labelAlignment": "left",
+        "colorForValue": [
+            {
+                "color": "#808080",
+                "value": "aus",
+                "valueType": "str"
+            },
+            {
+                "color": "#008000",
+                "value": "ein",
+                "valueType": "str"
+            },
+            {
+                "color": "#FFA500",
+                "value": "unbekannt",
+                "valueType": "str"
+            }
+        ],
+        "allowColorForValueInMessage": false,
+        "shape": "circle",
+        "showGlow": true,
+        "x": 900,
+        "y": 615,
+        "wires": []
+    },
+    {
+        "id": "284d5e57e13667d4",
+        "type": "ui_button",
+        "z": "57353fb1ead59d3e",
+        "name": "",
+        "group": "afcacc8ef8574799",
+        "order": 9,
+        "width": 2,
+        "height": 1,
+        "passthru": false,
+        "label": "Positionslichter",
+        "tooltip": "",
+        "color": "",
+        "bgcolor": "",
+        "className": "",
+        "icon": "fa-lightbulb-o",
+        "payload": "1",
+        "payloadType": "num",
+        "topic": "toggle",
+        "topicType": "str",
+        "x": 190,
+        "y": 540,
+        "wires": [
+            [
+                "8cd9cda73b291648"
+            ]
+        ]
+    },
+    {
+        "id": "79a3f55bcad4a5cc",
+        "type": "ui_slider",
+        "z": "57353fb1ead59d3e",
+        "name": "Positionslichter",
+        "label": "",
+        "tooltip": "",
+        "group": "afcacc8ef8574799",
+        "order": 10,
+        "width": 5,
+        "height": 1,
+        "passthru": true,
+        "outs": "all",
+        "topic": "slider",
+        "topicType": "str",
+        "min": 0,
+        "max": "100",
+        "step": 1,
+        "className": "",
+        "x": 190,
+        "y": 580,
+        "wires": [
+            [
+                "8cd9cda73b291648"
+            ]
+        ]
+    },
+    {
+        "id": "eab4c1af3ec136ef",
+        "type": "ui_spacer",
+        "z": "57353fb1ead59d3e",
+        "name": "spacer",
+        "group": "afcacc8ef8574799",
+        "order": 11,
+        "width": 1,
+        "height": 1
+    },
+    {
+        "id": "1ddf4011356b8474",
+        "type": "change",
+        "z": "57353fb1ead59d3e",
+        "name": "achtern",
+        "rules": [
+            {
+                "t": "set",
+                "p": "area",
+                "pt": "msg",
+                "to": "achtern",
+                "tot": "str"
+            }
+        ],
+        "x": 440,
+        "y": 760,
+        "wires": [
+            [
+                "f9912c6c784458ae"
+            ]
+        ]
+    },
+    {
+        "id": "f9912c6c784458ae",
+        "type": "function",
+        "z": "57353fb1ead59d3e",
+        "name": "Lichtsteuerung achtern",
+        "func": "// Lichtsteuerung: sieben Gruppen, nur innen/aussen sind RGB-Nachtmodusfaehig.\n// Context: flow.lights im Store \"file\". status.channels = letzte kommandierte Ziele.\nconst STORE = \"file\";\nconst root = flow.get(\"lights\", STORE);\nif (!root || typeof root !== \"object\" || !root.config) {\n    node.error(\"flow.lights.config fehlt im Store file: zuerst manuell initialisieren\", msg);\n    return null;\n}\nconst config = root.config;\nconst area = String(msg.area || \"\").trim();\nconst topic = String(msg.topic || \"\").toLowerCase();\nconst areaCfg = config[area];\nconst group = areaCfg?.[\"config group\"];\nif (!group || !Array.isArray(group[\"config segments\"])) {\n    node.error(\"Unbekannte Lichtgruppe: \" + area, msg);\n    return null;\n}\nroot.status = root.status || {};\nroot.status.channels = root.status.channels || {};\nconst values = root.status.channels;\nconst nm = flow.get(\"nightMode\", STORE) || {};\n// Migration: bisherige Sollwerte einmalig in den Nachtmodus-Context verschieben.\n// Vorhandene Backupwerte haben Vorrang; alte Werte nur ergaenzen.\nnm.ChannelBackupPreNightMode = nm.ChannelBackupPreNightMode || {};\nif (root.desiredChannels && typeof root.desiredChannels === \"object\") {\n    for (const [channel, value] of Object.entries(root.desiredChannels)) {\n        if (nm.ChannelBackupPreNightMode[channel] === undefined) {\n            nm.ChannelBackupPreNightMode[channel] = value;\n        }\n    }\n    delete root.desiredChannels;\n}\nconst desired = nm.ChannelBackupPreNightMode;\nconst isRgb = group.type === \"rgb\" && (area === \"innen\" || area === \"aussen\");\nconst nightActive = isRgb && (topic === \"night_apply\" ? msg.payload?.night === true : nm.active === true);\nconst colors = [\"r\", \"g\", \"b\", \"w\", \"ww\"];\nconst clamp = (v, lo = 0, hi = 100) => Math.max(lo, Math.min(hi, Number(v) || 0));\nconst all = new Map();\nfor (const segment of group[\"config segments\"]) {\n    for (const color of colors) {\n        const c = segment.channels?.[color];\n        if (!c || c.channel === null || c.channel === undefined || c.channel === \"\") continue;\n        const channel = Number(c.channel);\n        if (!Number.isInteger(channel)) continue;\n        const delay = Math.max(0, Number(c[\"on delay\"]) || 0);\n        const old = all.get(channel);\n        if (!old || delay >= old.delay) {\n            all.set(channel, { ...c, channel, color, delay });\n        }\n    }\n}\n// Beim Upgrade der bestehenden Installation Sollwerte aus gespeicherten Kanalwerten uebernehmen.\nfor (const n of all.keys()) {\n    if (desired[n] === undefined && values[n] !== undefined) desired[n] = Number(values[n]) || 0;\n}\nfunction groupState(name) {\n    const segs = config[name]?.[\"config group\"]?.[\"config segments\"];\n    if (!Array.isArray(segs)) return \"unknown\";\n    let known = 0, total = 0, active = false;\n    for (const seg of segs) for (const ch of Object.values(seg.channels || {})) {\n        if (ch?.channel === null || ch?.channel === undefined || ch.channel === \"\") continue;\n        total++;\n        const v = values[ch.channel];\n        if (v !== undefined && v !== null) {\n            known++;\n            if (Number(v) > 0) active = true;\n        }\n    }\n    return active ? \"on\" : (total > 0 && known === total ? \"off\" : \"unknown\");\n}\nfunction refreshStates() {\n    for (const name of [\"innen\", \"aussen\", \"position\", \"achtern\", \"top\", \"mast\", \"unterwasser\"]) {\n        if (config[name]) config[name].status = groupState(name);\n    }\n}\nfunction ledMsg() {\n    const s = groupState(area);\n    return { area, topic: \"state\", payload: s === \"on\" ? \"ein\" : s === \"off\" ? \"aus\" : \"unbekannt\" };\n}\nif (topic === \"refresh\") {\n    refreshStates();\n    flow.set(\"nightMode\", nm, STORE);\n    flow.set(\"lights\", root, STORE);\n    return [null, ledMsg()];\n}\nif (![\"toggle\", \"slider\", \"color\", \"colour\", \"rgb\", \"off\", \"alloff\", \"night_apply\"].includes(topic)) {\n    node.error(\"Unbekanntes Topic: \" + topic, msg);\n    return null;\n}\nif (topic === \"night_apply\" && !isRgb) return null;\n// Gruppenstatus bestimmt Alles-AUS, nicht der letzte Bedienmodus.\nconst desiredOn = [...all.keys()].some(n => Number(desired[n] || 0) > 0);\nif (topic === \"alloff\" && !desiredOn && groupState(area) === \"off\") {\n    refreshStates();\n    flow.set(\"nightMode\", nm, STORE);\n    flow.set(\"lights\", root, STORE);\n    return [null, ledMsg()];\n}\nconst turnOn = topic === \"toggle\" && !desiredOn;\nconst normalCommand = topic !== \"night_apply\";\nconst shuttingDown = topic === \"off\" || topic === \"alloff\" || (topic === \"toggle\" && !turnOn);\nconst baseFade = Number(group[\"fade speed\"]) || 0;\nconst transitionFade = Math.max(0, Number(msg.payload?.fadeMs) || 0);\nconst commands = new Map();\n\n// Neue Sollwerte errechnen, bevor die Nachtmodus-Maske auf sie angewandt wird.\nif (normalCommand) {\n    for (const ch of all.values()) {\n        const maxbright = clamp(ch.maxbright ?? 100);\n        let v = 0;\n        if (topic === \"toggle\") {\n            if (turnOn) v = Math.min(clamp(ch[\"auto brightness\"] ?? maxbright), maxbright);\n        } else if (topic === \"slider\") {\n            let minVal = clamp(ch.min_val ?? 0);\n            let maxVal = clamp(ch.max_val ?? ch.maxbright ?? 100);\n            if (maxVal < minVal) [minVal, maxVal] = [maxVal, minVal];\n            v = minVal + (maxVal - minVal) * clamp(msg.payload) / 100;\n        } else if ([\"color\", \"colour\", \"rgb\"].includes(topic)) {\n            const p = msg.payload && typeof msg.payload === \"object\" ? msg.payload : {};\n            v = Math.min(clamp(p[ch.color] ?? 0), maxbright);\n        }\n        desired[ch.channel] = v;\n    }\n}\nconst wantOn = [...all.keys()].some(n => Number(desired[n] || 0) > 0);\n// Funktioniert auch bei reiner G/B-Farbwahl: nachts rote Grundbeleuchtung einschalten.\nfunction physicalValue(ch) {\n    const requested = clamp(desired[ch.channel] ?? 0);\n    if (!nightActive || !wantOn) return requested;\n    if (ch.color === \"g\" || ch.color === \"b\") return 0;\n    if (ch.color === \"r\" && requested <= 0) {\n        return Math.min(clamp(ch[\"auto brightness\"] ?? ch.maxbright ?? 100), clamp(ch.maxbright ?? 100));\n    }\n    return requested;\n}\n// Ein- oder Ausschaltbefehle der normalen Gruppensteuerung behalten ihre Verzoegerungen.\nfor (const ch of all.values()) {\n    const output = physicalValue(ch);\n    const previous = values[ch.channel];\n    let delay = 0, fadeMs = 0;\n    if (topic === \"toggle\" || topic === \"alloff\") {\n        fadeMs = baseFade;\n        delay = shuttingDown ? Math.max(0, Number(ch[\"off delay\"]) || 0) : ch.delay;\n    } else if (topic === \"night_apply\") {\n        // Nur geaenderte Ausgangsziele werden ueberblendet; rote Kanaele bleiben sonst unangetastet.\n        fadeMs = (ch.color === \"g\" || ch.color === \"b\") ? transitionFade : Math.min(1000, transitionFade);\n    }\n    if (topic !== \"night_apply\" || previous === undefined || Math.abs(Number(previous) - output) > 0.00001) {\n        commands.set(ch.channel, { channel: ch.channel, value: output, fadeMs, delay });\n    }\n}\n// Vorhandene Einschalt-Timer bei einem neuen Gruppenbefehl loeschen.\n// Noch nicht abgeschickte Kanaele muessen bei night_apply neu ausgegeben werden.\nconst oldPending = context.get(\"pendingTimers\") || [];\nif (topic === \"night_apply\") {\n    for (const pending of oldPending) {\n        for (const n of pending.channels || []) {\n            if (!commands.has(n) && all.has(n)) {\n                const ch = all.get(n);\n                commands.set(n, {\n                    channel: n, value: physicalValue(ch),\n                    fadeMs: ch.color === \"g\" || ch.color === \"b\" ? transitionFade : baseFade,\n                    delay: 0\n                });\n            }\n        }\n    }\n}\nfor (const pending of oldPending) clearTimeout(pending.timer || pending);\ncontext.set(\"pendingTimers\", []);\nfor (const command of commands.values()) values[command.channel] = command.value;\nrefreshStates();\nif (normalCommand) {\n    const state = groupState(area);\n    areaCfg.mode = state === \"off\" ? \"off\" :\n        topic === \"toggle\" ? \"toggle\" :\n        topic === \"slider\" ? \"slider\" :\n        [\"color\", \"colour\", \"rgb\"].includes(topic) ? \"colour\" : \"off\";\n}\nflow.set(\"nightMode\", nm, STORE);\nflow.set(\"lights\", root, STORE);\nnode.send([null, ledMsg()]);\nconst byDelay = new Map();\nfor (const item of commands.values()) {\n    if (!byDelay.has(item.delay)) byDelay.set(item.delay, []);\n    byDelay.get(item.delay).push({ channel: item.channel, value: item.value, fadeMs: item.fadeMs });\n}\nconst timers = [];\nfor (const [delay, items] of byDelay) {\n    const out = { area, payload: { type: \"set_multi\", items } };\n    if (delay > 0) {\n        const t = setTimeout(() => {\n            const remaining = (context.get(\"pendingTimers\") || []).filter(p => p.timer !== t);\n            context.set(\"pendingTimers\", remaining);\n            node.send([out, null]);\n        }, delay);\n        timers.push({timer:t, channels:items.map(x=>x.channel)});\n    } else node.send([out, null]);\n}\ncontext.set(\"pendingTimers\", timers);\nreturn null;\n",
+        "outputs": 2,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 650,
+        "y": 760,
+        "wires": [
+            [
+                "a781f77933312619"
+            ],
+            [
+                "84b4cfbf94d34728"
+            ]
+        ]
+    },
+    {
+        "id": "a781f77933312619",
+        "type": "link out",
+        "z": "57353fb1ead59d3e",
+        "name": "ESP achtern",
+        "mode": "link",
+        "links": [
+            "d884558431ecd46d"
+        ],
+        "x": 890,
+        "y": 740,
+        "wires": []
+    },
+    {
+        "id": "84b4cfbf94d34728",
+        "type": "ui_led",
+        "z": "57353fb1ead59d3e",
+        "name": "Achterlicht",
+        "group": "afcacc8ef8574799",
+        "order": 16,
+        "width": 1,
+        "height": 1,
+        "label": "",
+        "labelPlacement": "left",
+        "labelAlignment": "left",
+        "colorForValue": [
+            {
+                "color": "#808080",
+                "value": "aus",
+                "valueType": "str"
+            },
+            {
+                "color": "#008000",
+                "value": "ein",
+                "valueType": "str"
+            },
+            {
+                "color": "#FFA500",
+                "value": "unbekannt",
+                "valueType": "str"
+            }
+        ],
+        "allowColorForValueInMessage": false,
+        "shape": "circle",
+        "showGlow": true,
+        "x": 900,
+        "y": 795,
+        "wires": []
+    },
+    {
+        "id": "7376450a4b1b1cfe",
+        "type": "ui_button",
+        "z": "57353fb1ead59d3e",
+        "name": "",
+        "group": "afcacc8ef8574799",
+        "order": 13,
+        "width": 2,
+        "height": 1,
+        "passthru": false,
+        "label": "Achterlicht",
+        "tooltip": "",
+        "color": "",
+        "bgcolor": "",
+        "className": "",
+        "icon": "fa-lightbulb-o",
+        "payload": "1",
+        "payloadType": "num",
+        "topic": "toggle",
+        "topicType": "str",
+        "x": 190,
+        "y": 720,
+        "wires": [
+            [
+                "1ddf4011356b8474"
+            ]
+        ]
+    },
+    {
+        "id": "677de627410d24c9",
+        "type": "ui_slider",
+        "z": "57353fb1ead59d3e",
+        "name": "Achterlicht",
+        "label": "",
+        "tooltip": "",
+        "group": "afcacc8ef8574799",
+        "order": 14,
+        "width": 5,
+        "height": 1,
+        "passthru": true,
+        "outs": "end",
+        "topic": "slider",
+        "topicType": "str",
+        "min": 0,
+        "max": "100",
+        "step": 1,
+        "className": "",
+        "x": 190,
+        "y": 760,
+        "wires": [
+            [
+                "1ddf4011356b8474"
+            ]
+        ]
+    },
+    {
+        "id": "6bd5c4161eafc6d7",
+        "type": "ui_spacer",
+        "z": "57353fb1ead59d3e",
+        "name": "spacer",
+        "group": "afcacc8ef8574799",
+        "order": 15,
+        "width": 1,
+        "height": 1
+    },
+    {
+        "id": "1f95a14c14b0bb9b",
+        "type": "change",
+        "z": "57353fb1ead59d3e",
+        "name": "top",
+        "rules": [
+            {
+                "t": "set",
+                "p": "area",
+                "pt": "msg",
+                "to": "top",
+                "tot": "str"
+            }
+        ],
+        "x": 440,
+        "y": 940,
+        "wires": [
+            [
+                "7ee47816e2becd28"
+            ]
+        ]
+    },
+    {
+        "id": "7ee47816e2becd28",
+        "type": "function",
+        "z": "57353fb1ead59d3e",
+        "name": "Lichtsteuerung top",
+        "func": "// Lichtsteuerung: sieben Gruppen, nur innen/aussen sind RGB-Nachtmodusfaehig.\n// Context: flow.lights im Store \"file\". status.channels = letzte kommandierte Ziele.\nconst STORE = \"file\";\nconst root = flow.get(\"lights\", STORE);\nif (!root || typeof root !== \"object\" || !root.config) {\n    node.error(\"flow.lights.config fehlt im Store file: zuerst manuell initialisieren\", msg);\n    return null;\n}\nconst config = root.config;\nconst area = String(msg.area || \"\").trim();\nconst topic = String(msg.topic || \"\").toLowerCase();\nconst areaCfg = config[area];\nconst group = areaCfg?.[\"config group\"];\nif (!group || !Array.isArray(group[\"config segments\"])) {\n    node.error(\"Unbekannte Lichtgruppe: \" + area, msg);\n    return null;\n}\nroot.status = root.status || {};\nroot.status.channels = root.status.channels || {};\nconst values = root.status.channels;\nconst nm = flow.get(\"nightMode\", STORE) || {};\n// Migration: bisherige Sollwerte einmalig in den Nachtmodus-Context verschieben.\n// Vorhandene Backupwerte haben Vorrang; alte Werte nur ergaenzen.\nnm.ChannelBackupPreNightMode = nm.ChannelBackupPreNightMode || {};\nif (root.desiredChannels && typeof root.desiredChannels === \"object\") {\n    for (const [channel, value] of Object.entries(root.desiredChannels)) {\n        if (nm.ChannelBackupPreNightMode[channel] === undefined) {\n            nm.ChannelBackupPreNightMode[channel] = value;\n        }\n    }\n    delete root.desiredChannels;\n}\nconst desired = nm.ChannelBackupPreNightMode;\nconst isRgb = group.type === \"rgb\" && (area === \"innen\" || area === \"aussen\");\nconst nightActive = isRgb && (topic === \"night_apply\" ? msg.payload?.night === true : nm.active === true);\nconst colors = [\"r\", \"g\", \"b\", \"w\", \"ww\"];\nconst clamp = (v, lo = 0, hi = 100) => Math.max(lo, Math.min(hi, Number(v) || 0));\nconst all = new Map();\nfor (const segment of group[\"config segments\"]) {\n    for (const color of colors) {\n        const c = segment.channels?.[color];\n        if (!c || c.channel === null || c.channel === undefined || c.channel === \"\") continue;\n        const channel = Number(c.channel);\n        if (!Number.isInteger(channel)) continue;\n        const delay = Math.max(0, Number(c[\"on delay\"]) || 0);\n        const old = all.get(channel);\n        if (!old || delay >= old.delay) {\n            all.set(channel, { ...c, channel, color, delay });\n        }\n    }\n}\n// Beim Upgrade der bestehenden Installation Sollwerte aus gespeicherten Kanalwerten uebernehmen.\nfor (const n of all.keys()) {\n    if (desired[n] === undefined && values[n] !== undefined) desired[n] = Number(values[n]) || 0;\n}\nfunction groupState(name) {\n    const segs = config[name]?.[\"config group\"]?.[\"config segments\"];\n    if (!Array.isArray(segs)) return \"unknown\";\n    let known = 0, total = 0, active = false;\n    for (const seg of segs) for (const ch of Object.values(seg.channels || {})) {\n        if (ch?.channel === null || ch?.channel === undefined || ch.channel === \"\") continue;\n        total++;\n        const v = values[ch.channel];\n        if (v !== undefined && v !== null) {\n            known++;\n            if (Number(v) > 0) active = true;\n        }\n    }\n    return active ? \"on\" : (total > 0 && known === total ? \"off\" : \"unknown\");\n}\nfunction refreshStates() {\n    for (const name of [\"innen\", \"aussen\", \"position\", \"achtern\", \"top\", \"mast\", \"unterwasser\"]) {\n        if (config[name]) config[name].status = groupState(name);\n    }\n}\nfunction ledMsg() {\n    const s = groupState(area);\n    return { area, topic: \"state\", payload: s === \"on\" ? \"ein\" : s === \"off\" ? \"aus\" : \"unbekannt\" };\n}\nif (topic === \"refresh\") {\n    refreshStates();\n    flow.set(\"nightMode\", nm, STORE);\n    flow.set(\"lights\", root, STORE);\n    return [null, ledMsg()];\n}\nif (![\"toggle\", \"slider\", \"color\", \"colour\", \"rgb\", \"off\", \"alloff\", \"night_apply\"].includes(topic)) {\n    node.error(\"Unbekanntes Topic: \" + topic, msg);\n    return null;\n}\nif (topic === \"night_apply\" && !isRgb) return null;\n// Gruppenstatus bestimmt Alles-AUS, nicht der letzte Bedienmodus.\nconst desiredOn = [...all.keys()].some(n => Number(desired[n] || 0) > 0);\nif (topic === \"alloff\" && !desiredOn && groupState(area) === \"off\") {\n    refreshStates();\n    flow.set(\"nightMode\", nm, STORE);\n    flow.set(\"lights\", root, STORE);\n    return [null, ledMsg()];\n}\nconst turnOn = topic === \"toggle\" && !desiredOn;\nconst normalCommand = topic !== \"night_apply\";\nconst shuttingDown = topic === \"off\" || topic === \"alloff\" || (topic === \"toggle\" && !turnOn);\nconst baseFade = Number(group[\"fade speed\"]) || 0;\nconst transitionFade = Math.max(0, Number(msg.payload?.fadeMs) || 0);\nconst commands = new Map();\n\n// Neue Sollwerte errechnen, bevor die Nachtmodus-Maske auf sie angewandt wird.\nif (normalCommand) {\n    for (const ch of all.values()) {\n        const maxbright = clamp(ch.maxbright ?? 100);\n        let v = 0;\n        if (topic === \"toggle\") {\n            if (turnOn) v = Math.min(clamp(ch[\"auto brightness\"] ?? maxbright), maxbright);\n        } else if (topic === \"slider\") {\n            let minVal = clamp(ch.min_val ?? 0);\n            let maxVal = clamp(ch.max_val ?? ch.maxbright ?? 100);\n            if (maxVal < minVal) [minVal, maxVal] = [maxVal, minVal];\n            v = minVal + (maxVal - minVal) * clamp(msg.payload) / 100;\n        } else if ([\"color\", \"colour\", \"rgb\"].includes(topic)) {\n            const p = msg.payload && typeof msg.payload === \"object\" ? msg.payload : {};\n            v = Math.min(clamp(p[ch.color] ?? 0), maxbright);\n        }\n        desired[ch.channel] = v;\n    }\n}\nconst wantOn = [...all.keys()].some(n => Number(desired[n] || 0) > 0);\n// Funktioniert auch bei reiner G/B-Farbwahl: nachts rote Grundbeleuchtung einschalten.\nfunction physicalValue(ch) {\n    const requested = clamp(desired[ch.channel] ?? 0);\n    if (!nightActive || !wantOn) return requested;\n    if (ch.color === \"g\" || ch.color === \"b\") return 0;\n    if (ch.color === \"r\" && requested <= 0) {\n        return Math.min(clamp(ch[\"auto brightness\"] ?? ch.maxbright ?? 100), clamp(ch.maxbright ?? 100));\n    }\n    return requested;\n}\n// Ein- oder Ausschaltbefehle der normalen Gruppensteuerung behalten ihre Verzoegerungen.\nfor (const ch of all.values()) {\n    const output = physicalValue(ch);\n    const previous = values[ch.channel];\n    let delay = 0, fadeMs = 0;\n    if (topic === \"toggle\" || topic === \"alloff\") {\n        fadeMs = baseFade;\n        delay = shuttingDown ? Math.max(0, Number(ch[\"off delay\"]) || 0) : ch.delay;\n    } else if (topic === \"night_apply\") {\n        // Nur geaenderte Ausgangsziele werden ueberblendet; rote Kanaele bleiben sonst unangetastet.\n        fadeMs = (ch.color === \"g\" || ch.color === \"b\") ? transitionFade : Math.min(1000, transitionFade);\n    }\n    if (topic !== \"night_apply\" || previous === undefined || Math.abs(Number(previous) - output) > 0.00001) {\n        commands.set(ch.channel, { channel: ch.channel, value: output, fadeMs, delay });\n    }\n}\n// Vorhandene Einschalt-Timer bei einem neuen Gruppenbefehl loeschen.\n// Noch nicht abgeschickte Kanaele muessen bei night_apply neu ausgegeben werden.\nconst oldPending = context.get(\"pendingTimers\") || [];\nif (topic === \"night_apply\") {\n    for (const pending of oldPending) {\n        for (const n of pending.channels || []) {\n            if (!commands.has(n) && all.has(n)) {\n                const ch = all.get(n);\n                commands.set(n, {\n                    channel: n, value: physicalValue(ch),\n                    fadeMs: ch.color === \"g\" || ch.color === \"b\" ? transitionFade : baseFade,\n                    delay: 0\n                });\n            }\n        }\n    }\n}\nfor (const pending of oldPending) clearTimeout(pending.timer || pending);\ncontext.set(\"pendingTimers\", []);\nfor (const command of commands.values()) values[command.channel] = command.value;\nrefreshStates();\nif (normalCommand) {\n    const state = groupState(area);\n    areaCfg.mode = state === \"off\" ? \"off\" :\n        topic === \"toggle\" ? \"toggle\" :\n        topic === \"slider\" ? \"slider\" :\n        [\"color\", \"colour\", \"rgb\"].includes(topic) ? \"colour\" : \"off\";\n}\nflow.set(\"nightMode\", nm, STORE);\nflow.set(\"lights\", root, STORE);\nnode.send([null, ledMsg()]);\nconst byDelay = new Map();\nfor (const item of commands.values()) {\n    if (!byDelay.has(item.delay)) byDelay.set(item.delay, []);\n    byDelay.get(item.delay).push({ channel: item.channel, value: item.value, fadeMs: item.fadeMs });\n}\nconst timers = [];\nfor (const [delay, items] of byDelay) {\n    const out = { area, payload: { type: \"set_multi\", items } };\n    if (delay > 0) {\n        const t = setTimeout(() => {\n            const remaining = (context.get(\"pendingTimers\") || []).filter(p => p.timer !== t);\n            context.set(\"pendingTimers\", remaining);\n            node.send([out, null]);\n        }, delay);\n        timers.push({timer:t, channels:items.map(x=>x.channel)});\n    } else node.send([out, null]);\n}\ncontext.set(\"pendingTimers\", timers);\nreturn null;\n",
+        "outputs": 2,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 650,
+        "y": 940,
+        "wires": [
+            [
+                "262f95cadefdcf21"
+            ],
+            [
+                "3ffcf2ef37a85325"
+            ]
+        ]
+    },
+    {
+        "id": "262f95cadefdcf21",
+        "type": "link out",
+        "z": "57353fb1ead59d3e",
+        "name": "ESP top",
+        "mode": "link",
+        "links": [
+            "d884558431ecd46d"
+        ],
+        "x": 890,
+        "y": 920,
+        "wires": []
+    },
+    {
+        "id": "3ffcf2ef37a85325",
+        "type": "ui_led",
+        "z": "57353fb1ead59d3e",
+        "name": "Toplicht",
+        "group": "afcacc8ef8574799",
+        "order": 20,
+        "width": 1,
+        "height": 1,
+        "label": "",
+        "labelPlacement": "left",
+        "labelAlignment": "left",
+        "colorForValue": [
+            {
+                "color": "#808080",
+                "value": "aus",
+                "valueType": "str"
+            },
+            {
+                "color": "#008000",
+                "value": "ein",
+                "valueType": "str"
+            },
+            {
+                "color": "#FFA500",
+                "value": "unbekannt",
+                "valueType": "str"
+            }
+        ],
+        "allowColorForValueInMessage": false,
+        "shape": "circle",
+        "showGlow": true,
+        "x": 900,
+        "y": 975,
+        "wires": []
+    },
+    {
+        "id": "794cdc9abf25b74b",
+        "type": "ui_button",
+        "z": "57353fb1ead59d3e",
+        "name": "",
+        "group": "afcacc8ef8574799",
+        "order": 17,
+        "width": 2,
+        "height": 1,
+        "passthru": false,
+        "label": "Toplicht",
+        "tooltip": "",
+        "color": "",
+        "bgcolor": "",
+        "className": "",
+        "icon": "fa-lightbulb-o",
+        "payload": "1",
+        "payloadType": "num",
+        "topic": "toggle",
+        "topicType": "str",
+        "x": 190,
+        "y": 900,
+        "wires": [
+            [
+                "1f95a14c14b0bb9b"
+            ]
+        ]
+    },
+    {
+        "id": "5847c0c62fb4d94d",
+        "type": "ui_slider",
+        "z": "57353fb1ead59d3e",
+        "name": "Toplicht",
+        "label": "",
+        "tooltip": "",
+        "group": "afcacc8ef8574799",
+        "order": 18,
+        "width": 5,
+        "height": 1,
+        "passthru": true,
+        "outs": "end",
+        "topic": "slider",
+        "topicType": "str",
+        "min": 0,
+        "max": "100",
+        "step": 1,
+        "className": "",
+        "x": 190,
+        "y": 940,
+        "wires": [
+            [
+                "1f95a14c14b0bb9b"
+            ]
+        ]
+    },
+    {
+        "id": "d4d1e70e6abcbfd8",
+        "type": "ui_spacer",
+        "z": "57353fb1ead59d3e",
+        "name": "spacer",
+        "group": "afcacc8ef8574799",
+        "order": 19,
+        "width": 1,
+        "height": 1
+    },
+    {
+        "id": "329838acef25e40b",
+        "type": "change",
+        "z": "57353fb1ead59d3e",
+        "name": "mast",
+        "rules": [
+            {
+                "t": "set",
+                "p": "area",
+                "pt": "msg",
+                "to": "mast",
+                "tot": "str"
+            }
+        ],
+        "x": 440,
+        "y": 1120,
+        "wires": [
+            [
+                "0484c9eb285423e9"
+            ]
+        ]
+    },
+    {
+        "id": "0484c9eb285423e9",
+        "type": "function",
+        "z": "57353fb1ead59d3e",
+        "name": "Lichtsteuerung mast",
+        "func": "// Lichtsteuerung: sieben Gruppen, nur innen/aussen sind RGB-Nachtmodusfaehig.\n// Context: flow.lights im Store \"file\". status.channels = letzte kommandierte Ziele.\nconst STORE = \"file\";\nconst root = flow.get(\"lights\", STORE);\nif (!root || typeof root !== \"object\" || !root.config) {\n    node.error(\"flow.lights.config fehlt im Store file: zuerst manuell initialisieren\", msg);\n    return null;\n}\nconst config = root.config;\nconst area = String(msg.area || \"\").trim();\nconst topic = String(msg.topic || \"\").toLowerCase();\nconst areaCfg = config[area];\nconst group = areaCfg?.[\"config group\"];\nif (!group || !Array.isArray(group[\"config segments\"])) {\n    node.error(\"Unbekannte Lichtgruppe: \" + area, msg);\n    return null;\n}\nroot.status = root.status || {};\nroot.status.channels = root.status.channels || {};\nconst values = root.status.channels;\nconst nm = flow.get(\"nightMode\", STORE) || {};\n// Migration: bisherige Sollwerte einmalig in den Nachtmodus-Context verschieben.\n// Vorhandene Backupwerte haben Vorrang; alte Werte nur ergaenzen.\nnm.ChannelBackupPreNightMode = nm.ChannelBackupPreNightMode || {};\nif (root.desiredChannels && typeof root.desiredChannels === \"object\") {\n    for (const [channel, value] of Object.entries(root.desiredChannels)) {\n        if (nm.ChannelBackupPreNightMode[channel] === undefined) {\n            nm.ChannelBackupPreNightMode[channel] = value;\n        }\n    }\n    delete root.desiredChannels;\n}\nconst desired = nm.ChannelBackupPreNightMode;\nconst isRgb = group.type === \"rgb\" && (area === \"innen\" || area === \"aussen\");\nconst nightActive = isRgb && (topic === \"night_apply\" ? msg.payload?.night === true : nm.active === true);\nconst colors = [\"r\", \"g\", \"b\", \"w\", \"ww\"];\nconst clamp = (v, lo = 0, hi = 100) => Math.max(lo, Math.min(hi, Number(v) || 0));\nconst all = new Map();\nfor (const segment of group[\"config segments\"]) {\n    for (const color of colors) {\n        const c = segment.channels?.[color];\n        if (!c || c.channel === null || c.channel === undefined || c.channel === \"\") continue;\n        const channel = Number(c.channel);\n        if (!Number.isInteger(channel)) continue;\n        const delay = Math.max(0, Number(c[\"on delay\"]) || 0);\n        const old = all.get(channel);\n        if (!old || delay >= old.delay) {\n            all.set(channel, { ...c, channel, color, delay });\n        }\n    }\n}\n// Beim Upgrade der bestehenden Installation Sollwerte aus gespeicherten Kanalwerten uebernehmen.\nfor (const n of all.keys()) {\n    if (desired[n] === undefined && values[n] !== undefined) desired[n] = Number(values[n]) || 0;\n}\nfunction groupState(name) {\n    const segs = config[name]?.[\"config group\"]?.[\"config segments\"];\n    if (!Array.isArray(segs)) return \"unknown\";\n    let known = 0, total = 0, active = false;\n    for (const seg of segs) for (const ch of Object.values(seg.channels || {})) {\n        if (ch?.channel === null || ch?.channel === undefined || ch.channel === \"\") continue;\n        total++;\n        const v = values[ch.channel];\n        if (v !== undefined && v !== null) {\n            known++;\n            if (Number(v) > 0) active = true;\n        }\n    }\n    return active ? \"on\" : (total > 0 && known === total ? \"off\" : \"unknown\");\n}\nfunction refreshStates() {\n    for (const name of [\"innen\", \"aussen\", \"position\", \"achtern\", \"top\", \"mast\", \"unterwasser\"]) {\n        if (config[name]) config[name].status = groupState(name);\n    }\n}\nfunction ledMsg() {\n    const s = groupState(area);\n    return { area, topic: \"state\", payload: s === \"on\" ? \"ein\" : s === \"off\" ? \"aus\" : \"unbekannt\" };\n}\nif (topic === \"refresh\") {\n    refreshStates();\n    flow.set(\"nightMode\", nm, STORE);\n    flow.set(\"lights\", root, STORE);\n    return [null, ledMsg()];\n}\nif (![\"toggle\", \"slider\", \"color\", \"colour\", \"rgb\", \"off\", \"alloff\", \"night_apply\"].includes(topic)) {\n    node.error(\"Unbekanntes Topic: \" + topic, msg);\n    return null;\n}\nif (topic === \"night_apply\" && !isRgb) return null;\n// Gruppenstatus bestimmt Alles-AUS, nicht der letzte Bedienmodus.\nconst desiredOn = [...all.keys()].some(n => Number(desired[n] || 0) > 0);\nif (topic === \"alloff\" && !desiredOn && groupState(area) === \"off\") {\n    refreshStates();\n    flow.set(\"nightMode\", nm, STORE);\n    flow.set(\"lights\", root, STORE);\n    return [null, ledMsg()];\n}\nconst turnOn = topic === \"toggle\" && !desiredOn;\nconst normalCommand = topic !== \"night_apply\";\nconst shuttingDown = topic === \"off\" || topic === \"alloff\" || (topic === \"toggle\" && !turnOn);\nconst baseFade = Number(group[\"fade speed\"]) || 0;\nconst transitionFade = Math.max(0, Number(msg.payload?.fadeMs) || 0);\nconst commands = new Map();\n\n// Neue Sollwerte errechnen, bevor die Nachtmodus-Maske auf sie angewandt wird.\nif (normalCommand) {\n    for (const ch of all.values()) {\n        const maxbright = clamp(ch.maxbright ?? 100);\n        let v = 0;\n        if (topic === \"toggle\") {\n            if (turnOn) v = Math.min(clamp(ch[\"auto brightness\"] ?? maxbright), maxbright);\n        } else if (topic === \"slider\") {\n            let minVal = clamp(ch.min_val ?? 0);\n            let maxVal = clamp(ch.max_val ?? ch.maxbright ?? 100);\n            if (maxVal < minVal) [minVal, maxVal] = [maxVal, minVal];\n            v = minVal + (maxVal - minVal) * clamp(msg.payload) / 100;\n        } else if ([\"color\", \"colour\", \"rgb\"].includes(topic)) {\n            const p = msg.payload && typeof msg.payload === \"object\" ? msg.payload : {};\n            v = Math.min(clamp(p[ch.color] ?? 0), maxbright);\n        }\n        desired[ch.channel] = v;\n    }\n}\nconst wantOn = [...all.keys()].some(n => Number(desired[n] || 0) > 0);\n// Funktioniert auch bei reiner G/B-Farbwahl: nachts rote Grundbeleuchtung einschalten.\nfunction physicalValue(ch) {\n    const requested = clamp(desired[ch.channel] ?? 0);\n    if (!nightActive || !wantOn) return requested;\n    if (ch.color === \"g\" || ch.color === \"b\") return 0;\n    if (ch.color === \"r\" && requested <= 0) {\n        return Math.min(clamp(ch[\"auto brightness\"] ?? ch.maxbright ?? 100), clamp(ch.maxbright ?? 100));\n    }\n    return requested;\n}\n// Ein- oder Ausschaltbefehle der normalen Gruppensteuerung behalten ihre Verzoegerungen.\nfor (const ch of all.values()) {\n    const output = physicalValue(ch);\n    const previous = values[ch.channel];\n    let delay = 0, fadeMs = 0;\n    if (topic === \"toggle\" || topic === \"alloff\") {\n        fadeMs = baseFade;\n        delay = shuttingDown ? Math.max(0, Number(ch[\"off delay\"]) || 0) : ch.delay;\n    } else if (topic === \"night_apply\") {\n        // Nur geaenderte Ausgangsziele werden ueberblendet; rote Kanaele bleiben sonst unangetastet.\n        fadeMs = (ch.color === \"g\" || ch.color === \"b\") ? transitionFade : Math.min(1000, transitionFade);\n    }\n    if (topic !== \"night_apply\" || previous === undefined || Math.abs(Number(previous) - output) > 0.00001) {\n        commands.set(ch.channel, { channel: ch.channel, value: output, fadeMs, delay });\n    }\n}\n// Vorhandene Einschalt-Timer bei einem neuen Gruppenbefehl loeschen.\n// Noch nicht abgeschickte Kanaele muessen bei night_apply neu ausgegeben werden.\nconst oldPending = context.get(\"pendingTimers\") || [];\nif (topic === \"night_apply\") {\n    for (const pending of oldPending) {\n        for (const n of pending.channels || []) {\n            if (!commands.has(n) && all.has(n)) {\n                const ch = all.get(n);\n                commands.set(n, {\n                    channel: n, value: physicalValue(ch),\n                    fadeMs: ch.color === \"g\" || ch.color === \"b\" ? transitionFade : baseFade,\n                    delay: 0\n                });\n            }\n        }\n    }\n}\nfor (const pending of oldPending) clearTimeout(pending.timer || pending);\ncontext.set(\"pendingTimers\", []);\nfor (const command of commands.values()) values[command.channel] = command.value;\nrefreshStates();\nif (normalCommand) {\n    const state = groupState(area);\n    areaCfg.mode = state === \"off\" ? \"off\" :\n        topic === \"toggle\" ? \"toggle\" :\n        topic === \"slider\" ? \"slider\" :\n        [\"color\", \"colour\", \"rgb\"].includes(topic) ? \"colour\" : \"off\";\n}\nflow.set(\"nightMode\", nm, STORE);\nflow.set(\"lights\", root, STORE);\nnode.send([null, ledMsg()]);\nconst byDelay = new Map();\nfor (const item of commands.values()) {\n    if (!byDelay.has(item.delay)) byDelay.set(item.delay, []);\n    byDelay.get(item.delay).push({ channel: item.channel, value: item.value, fadeMs: item.fadeMs });\n}\nconst timers = [];\nfor (const [delay, items] of byDelay) {\n    const out = { area, payload: { type: \"set_multi\", items } };\n    if (delay > 0) {\n        const t = setTimeout(() => {\n            const remaining = (context.get(\"pendingTimers\") || []).filter(p => p.timer !== t);\n            context.set(\"pendingTimers\", remaining);\n            node.send([out, null]);\n        }, delay);\n        timers.push({timer:t, channels:items.map(x=>x.channel)});\n    } else node.send([out, null]);\n}\ncontext.set(\"pendingTimers\", timers);\nreturn null;\n",
+        "outputs": 2,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 650,
+        "y": 1120,
+        "wires": [
+            [
+                "be81ddbb3d28ed78"
+            ],
+            [
+                "4fcaa41aaa18f28a"
+            ]
+        ]
+    },
+    {
+        "id": "be81ddbb3d28ed78",
+        "type": "link out",
+        "z": "57353fb1ead59d3e",
+        "name": "ESP mast",
+        "mode": "link",
+        "links": [
+            "d884558431ecd46d"
+        ],
+        "x": 890,
+        "y": 1100,
+        "wires": []
+    },
+    {
+        "id": "4fcaa41aaa18f28a",
+        "type": "ui_led",
+        "z": "57353fb1ead59d3e",
+        "name": "Mast",
+        "group": "afcacc8ef8574799",
+        "order": 24,
+        "width": 1,
+        "height": 1,
+        "label": "",
+        "labelPlacement": "left",
+        "labelAlignment": "left",
+        "colorForValue": [
+            {
+                "color": "#808080",
+                "value": "aus",
+                "valueType": "str"
+            },
+            {
+                "color": "#008000",
+                "value": "ein",
+                "valueType": "str"
+            },
+            {
+                "color": "#FFA500",
+                "value": "unbekannt",
+                "valueType": "str"
+            }
+        ],
+        "allowColorForValueInMessage": false,
+        "shape": "circle",
+        "showGlow": true,
+        "x": 900,
+        "y": 1155,
+        "wires": []
+    },
+    {
+        "id": "6f58d59b41600fa2",
+        "type": "ui_button",
+        "z": "57353fb1ead59d3e",
+        "name": "",
+        "group": "afcacc8ef8574799",
+        "order": 21,
+        "width": 2,
+        "height": 1,
+        "passthru": false,
+        "label": "Mast",
+        "tooltip": "",
+        "color": "",
+        "bgcolor": "",
+        "className": "",
+        "icon": "fa-lightbulb-o",
+        "payload": "1",
+        "payloadType": "num",
+        "topic": "toggle",
+        "topicType": "str",        "x": 190,
+        "y": 1080,
+        "wires": [
+            [
+                "329838acef25e40b"
+            ]
+        ]
+    },
+    {
+        "id": "9d0d9cf1bc7f3b3a",
+        "type": "ui_slider",
+        "z": "57353fb1ead59d3e",
+        "name": "Mast",
+        "label": "",
+        "tooltip": "",
+        "group": "afcacc8ef8574799",
+        "order": 22,
+        "width": 5,
+        "height": 1,
+        "passthru": true,
+        "outs": "end",
+        "topic": "slider",
+        "topicType": "str",
+        "min": 0,
+        "max": "100",
+        "step": 1,
+        "className": "",
+        "x": 190,
+        "y": 1120,
+        "wires": [
+            [
+                "329838acef25e40b"
+            ]
+        ]
+    },
+    {
+        "id": "842e7c7125a5a744",
+        "type": "ui_spacer",
+        "z": "57353fb1ead59d3e",
+        "name": "spacer",
+        "group": "afcacc8ef8574799",
+        "order": 23,
+        "width": 1,
+        "height": 1
+    },
+    {
+        "id": "a29b491a48992886",
+        "type": "change",
+        "z": "57353fb1ead59d3e",
+        "name": "unterwasser",
+        "rules": [
+            {
+                "t": "set",
+                "p": "area",
+                "pt": "msg",
+                "to": "unterwasser",
+                "tot": "str"
+            }
+        ],
+        "x": 440,
+        "y": 1300,
+        "wires": [
+            [
+                "cf9e3fe8fd7f4e9b"
+            ]
+        ]
+    },
+    {
+        "id": "cf9e3fe8fd7f4e9b",
+        "type": "function",
+        "z": "57353fb1ead59d3e",
+        "name": "Lichtsteuerung unterwasser",
+        "func": "// Lichtsteuerung: sieben Gruppen, nur innen/aussen sind RGB-Nachtmodusfaehig.\n// Context: flow.lights im Store \"file\". status.channels = letzte kommandierte Ziele.\nconst STORE = \"file\";\nconst root = flow.get(\"lights\", STORE);\nif (!root || typeof root !== \"object\" || !root.config) {\n    node.error(\"flow.lights.config fehlt im Store file: zuerst manuell initialisieren\", msg);\n    return null;\n}\nconst config = root.config;\nconst area = String(msg.area || \"\").trim();\nconst topic = String(msg.topic || \"\").toLowerCase();\nconst areaCfg = config[area];\nconst group = areaCfg?.[\"config group\"];\nif (!group || !Array.isArray(group[\"config segments\"])) {\n    node.error(\"Unbekannte Lichtgruppe: \" + area, msg);\n    return null;\n}\nroot.status = root.status || {};\nroot.status.channels = root.status.channels || {};\nconst values = root.status.channels;\nconst nm = flow.get(\"nightMode\", STORE) || {};\n// Migration: bisherige Sollwerte einmalig in den Nachtmodus-Context verschieben.\n// Vorhandene Backupwerte haben Vorrang; alte Werte nur ergaenzen.\nnm.ChannelBackupPreNightMode = nm.ChannelBackupPreNightMode || {};\nif (root.desiredChannels && typeof root.desiredChannels === \"object\") {\n    for (const [channel, value] of Object.entries(root.desiredChannels)) {\n        if (nm.ChannelBackupPreNightMode[channel] === undefined) {\n            nm.ChannelBackupPreNightMode[channel] = value;\n        }\n    }\n    delete root.desiredChannels;\n}\nconst desired = nm.ChannelBackupPreNightMode;\nconst isRgb = group.type === \"rgb\" && (area === \"innen\" || area === \"aussen\");\nconst nightActive = isRgb && (topic === \"night_apply\" ? msg.payload?.night === true : nm.active === true);\nconst colors = [\"r\", \"g\", \"b\", \"w\", \"ww\"];\nconst clamp = (v, lo = 0, hi = 100) => Math.max(lo, Math.min(hi, Number(v) || 0));\nconst all = new Map();\nfor (const segment of group[\"config segments\"]) {\n    for (const color of colors) {\n        const c = segment.channels?.[color];\n        if (!c || c.channel === null || c.channel === undefined || c.channel === \"\") continue;\n        const channel = Number(c.channel);\n        if (!Number.isInteger(channel)) continue;\n        const delay = Math.max(0, Number(c[\"on delay\"]) || 0);\n        const old = all.get(channel);\n        if (!old || delay >= old.delay) {\n            all.set(channel, { ...c, channel, color, delay });\n        }\n    }\n}\n// Beim Upgrade der bestehenden Installation Sollwerte aus gespeicherten Kanalwerten uebernehmen.\nfor (const n of all.keys()) {\n    if (desired[n] === undefined && values[n] !== undefined) desired[n] = Number(values[n]) || 0;\n}\nfunction groupState(name) {\n    const segs = config[name]?.[\"config group\"]?.[\"config segments\"];\n    if (!Array.isArray(segs)) return \"unknown\";\n    let known = 0, total = 0, active = false;\n    for (const seg of segs) for (const ch of Object.values(seg.channels || {})) {\n        if (ch?.channel === null || ch?.channel === undefined || ch.channel === \"\") continue;\n        total++;\n        const v = values[ch.channel];\n        if (v !== undefined && v !== null) {\n            known++;\n            if (Number(v) > 0) active = true;\n        }\n    }\n    return active ? \"on\" : (total > 0 && known === total ? \"off\" : \"unknown\");\n}\nfunction refreshStates() {\n    for (const name of [\"innen\", \"aussen\", \"position\", \"achtern\", \"top\", \"mast\", \"unterwasser\"]) {\n        if (config[name]) config[name].status = groupState(name);\n    }\n}\nfunction ledMsg() {\n    const s = groupState(area);\n    return { area, topic: \"state\", payload: s === \"on\" ? \"ein\" : s === \"off\" ? \"aus\" : \"unbekannt\" };\n}\nif (topic === \"refresh\") {\n    refreshStates();\n    flow.set(\"nightMode\", nm, STORE);\n    flow.set(\"lights\", root, STORE);\n    return [null, ledMsg()];\n}\nif (![\"toggle\", \"slider\", \"color\", \"colour\", \"rgb\", \"off\", \"alloff\", \"night_apply\"].includes(topic)) {\n    node.error(\"Unbekanntes Topic: \" + topic, msg);\n    return null;\n}\nif (topic === \"night_apply\" && !isRgb) return null;\n// Gruppenstatus bestimmt Alles-AUS, nicht der letzte Bedienmodus.\nconst desiredOn = [...all.keys()].some(n => Number(desired[n] || 0) > 0);\nif (topic === \"alloff\" && !desiredOn && groupState(area) === \"off\") {\n    refreshStates();\n    flow.set(\"nightMode\", nm, STORE);\n    flow.set(\"lights\", root, STORE);\n    return [null, ledMsg()];\n}\nconst turnOn = topic === \"toggle\" && !desiredOn;\nconst normalCommand = topic !== \"night_apply\";\nconst shuttingDown = topic === \"off\" || topic === \"alloff\" || (topic === \"toggle\" && !turnOn);\nconst baseFade = Number(group[\"fade speed\"]) || 0;\nconst transitionFade = Math.max(0, Number(msg.payload?.fadeMs) || 0);\nconst commands = new Map();\n\n// Neue Sollwerte errechnen, bevor die Nachtmodus-Maske auf sie angewandt wird.\nif (normalCommand) {\n    for (const ch of all.values()) {\n        const maxbright = clamp(ch.maxbright ?? 100);\n        let v = 0;\n        if (topic === \"toggle\") {\n            if (turnOn) v = Math.min(clamp(ch[\"auto brightness\"] ?? maxbright), maxbright);\n        } else if (topic === \"slider\") {\n            let minVal = clamp(ch.min_val ?? 0);\n            let maxVal = clamp(ch.max_val ?? ch.maxbright ?? 100);\n            if (maxVal < minVal) [minVal, maxVal] = [maxVal, minVal];\n            v = minVal + (maxVal - minVal) * clamp(msg.payload) / 100;\n        } else if ([\"color\", \"colour\", \"rgb\"].includes(topic)) {\n            const p = msg.payload && typeof msg.payload === \"object\" ? msg.payload : {};\n            v = Math.min(clamp(p[ch.color] ?? 0), maxbright);\n        }\n        desired[ch.channel] = v;\n    }\n}\nconst wantOn = [...all.keys()].some(n => Number(desired[n] || 0) > 0);\n// Funktioniert auch bei reiner G/B-Farbwahl: nachts rote Grundbeleuchtung einschalten.\nfunction physicalValue(ch) {\n    const requested = clamp(desired[ch.channel] ?? 0);\n    if (!nightActive || !wantOn) return requested;\n    if (ch.color === \"g\" || ch.color === \"b\") return 0;\n    if (ch.color === \"r\" && requested <= 0) {\n        return Math.min(clamp(ch[\"auto brightness\"] ?? ch.maxbright ?? 100), clamp(ch.maxbright ?? 100));\n    }\n    return requested;\n}\n// Ein- oder Ausschaltbefehle der normalen Gruppensteuerung behalten ihre Verzoegerungen.\nfor (const ch of all.values()) {\n    const output = physicalValue(ch);\n    const previous = values[ch.channel];\n    let delay = 0, fadeMs = 0;\n    if (topic === \"toggle\" || topic === \"alloff\") {\n        fadeMs = baseFade;\n        delay = shuttingDown ? Math.max(0, Number(ch[\"off delay\"]) || 0) : ch.delay;\n    } else if (topic === \"night_apply\") {\n        // Nur geaenderte Ausgangsziele werden ueberblendet; rote Kanaele bleiben sonst unangetastet.\n        fadeMs = (ch.color === \"g\" || ch.color === \"b\") ? transitionFade : Math.min(1000, transitionFade);\n    }\n    if (topic !== \"night_apply\" || previous === undefined || Math.abs(Number(previous) - output) > 0.00001) {\n        commands.set(ch.channel, { channel: ch.channel, value: output, fadeMs, delay });\n    }\n}\n// Vorhandene Einschalt-Timer bei einem neuen Gruppenbefehl loeschen.\n// Noch nicht abgeschickte Kanaele muessen bei night_apply neu ausgegeben werden.\nconst oldPending = context.get(\"pendingTimers\") || [];\nif (topic === \"night_apply\") {\n    for (const pending of oldPending) {\n        for (const n of pending.channels || []) {\n            if (!commands.has(n) && all.has(n)) {\n                const ch = all.get(n);\n                commands.set(n, {\n                    channel: n, value: physicalValue(ch),\n                    fadeMs: ch.color === \"g\" || ch.color === \"b\" ? transitionFade : baseFade,\n                    delay: 0\n                });\n            }\n        }\n    }\n}\nfor (const pending of oldPending) clearTimeout(pending.timer || pending);\ncontext.set(\"pendingTimers\", []);\nfor (const command of commands.values()) values[command.channel] = command.value;\nrefreshStates();\nif (normalCommand) {\n    const state = groupState(area);\n    areaCfg.mode = state === \"off\" ? \"off\" :\n        topic === \"toggle\" ? \"toggle\" :\n        topic === \"slider\" ? \"slider\" :\n        [\"color\", \"colour\", \"rgb\"].includes(topic) ? \"colour\" : \"off\";\n}\nflow.set(\"nightMode\", nm, STORE);\nflow.set(\"lights\", root, STORE);\nnode.send([null, ledMsg()]);\nconst byDelay = new Map();\nfor (const item of commands.values()) {\n    if (!byDelay.has(item.delay)) byDelay.set(item.delay, []);\n    byDelay.get(item.delay).push({ channel: item.channel, value: item.value, fadeMs: item.fadeMs });\n}\nconst timers = [];\nfor (const [delay, items] of byDelay) {\n    const out = { area, payload: { type: \"set_multi\", items } };\n    if (delay > 0) {\n        const t = setTimeout(() => {\n            const remaining = (context.get(\"pendingTimers\") || []).filter(p => p.timer !== t);\n            context.set(\"pendingTimers\", remaining);\n            node.send([out, null]);\n        }, delay);\n        timers.push({timer:t, channels:items.map(x=>x.channel)});\n    } else node.send([out, null]);\n}\ncontext.set(\"pendingTimers\", timers);\nreturn null;\n",
+        "outputs": 2,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 650,
+        "y": 1300,
+        "wires": [
+            [
+                "f727d3983749add5"
+            ],
+            [
+                "b2104a54e5b4995d"
+            ]
+        ]
+    },
+    {
+        "id": "f727d3983749add5",
+        "type": "link out",
+        "z": "57353fb1ead59d3e",
+        "name": "ESP unterwasser",
+        "mode": "link",
+        "links": [
+            "d884558431ecd46d"
+        ],
+        "x": 890,
+        "y": 1280,
+        "wires": []
+    },
+    {
+        "id": "b2104a54e5b4995d",
+        "type": "ui_led",
+        "z": "57353fb1ead59d3e",
+        "name": "UW",
+        "group": "afcacc8ef8574799",
+        "order": 28,
+        "width": 1,
+        "height": 1,
+        "label": "",
+        "labelPlacement": "left",
+        "labelAlignment": "left",
+        "colorForValue": [
+            {
+                "color": "#808080",
+                "value": "aus",
+                "valueType": "str"
+            },
+            {
+                "color": "#008000",
+                "value": "ein",
+                "valueType": "str"
+            },
+            {
+                "color": "#FFA500",
+                "value": "unbekannt",
+                "valueType": "str"
+            }
+        ],
+        "allowColorForValueInMessage": false,
+        "shape": "circle",
+        "showGlow": true,
+        "x": 900,
+        "y": 1335,
+        "wires": []
+    },
+    {
+        "id": "c3205d3a75ad6c6e",
+        "type": "ui_button",
+        "z": "57353fb1ead59d3e",
+        "name": "",
+        "group": "afcacc8ef8574799",
+        "order": 25,
+        "width": 2,
+        "height": 1,
+        "passthru": false,
+        "label": "UW",
+        "tooltip": "",
+        "color": "",
+        "bgcolor": "",
+        "className": "",
+        "icon": "fa-lightbulb-o",
+        "payload": "1",
+        "payloadType": "num",
+        "topic": "toggle",
+        "topicType": "str",
+        "x": 190,
+        "y": 1260,
+        "wires": [
+            [
+                "a29b491a48992886"
+            ]
+        ]
+    },
+    {
+        "id": "ed072684431aa650",
+        "type": "ui_slider",
+        "z": "57353fb1ead59d3e",
+        "name": "UW",
+        "label": "",
+        "tooltip": "",
+        "group": "afcacc8ef8574799",
+        "order": 26,
+        "width": 5,
+        "height": 1,
+        "passthru": true,
+        "outs": "end",
+        "topic": "slider",
+        "topicType": "str",
+        "min": 0,
+        "max": "100",
+        "step": 1,
+        "className": "",
+        "x": 190,
+        "y": 1300,
+        "wires": [
+            [
+                "a29b491a48992886"
+            ]
+        ]
+    },
+    {
+        "id": "820f3320bcd97cb6",
+        "type": "ui_spacer",
+        "z": "57353fb1ead59d3e",
+        "name": "spacer",
+        "group": "afcacc8ef8574799",
+        "order": 27,
+        "width": 1,
+        "height": 1
+    },
+    {
+        "id": "3b476f6f6a795c9f",
+        "type": "ui_ui_control",
+        "z": "57353fb1ead59d3e",
+        "name": "Dashboard neu verbunden",
+        "events": "all",
+        "x": 140,
+        "y": 1600,
+        "wires": [
+            [
+                "430e4ae516c7ea0d"
+            ]
+        ]
+    },
+    {
+        "id": "430e4ae516c7ea0d",
+        "type": "function",
+        "z": "57353fb1ead59d3e",
+        "name": "LEDs bei Verbindung aktualisieren",
+        "func": "if (msg.payload !== \"connect\" && !(msg.payload === \"change\" && msg.name === \"Licht\")) return null; return {topic:\"refresh\",payload:null};",
+        "outputs": 1,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 500,
+        "y": 1600,
+        "wires": [
+            [
+                "69b56c60c4d189b9"
+            ]
+        ]
+    },
+    {
+        "id": "c3d4e76a98b8d3fe",
+        "type": "inject",
+        "z": "57353fb1ead59d3e",
+        "name": "Status aktualisieren (manuell)",
+        "props": [
+            {
+                "p": "topic",
+                "vt": "str"
+            }
+        ],
+        "repeat": "",
+        "crontab": "",
+        "once": true,
+        "onceDelay": 1,
+        "topic": "refresh",
+        "x": 150,
+        "y": 1675,
+        "wires": [
+            [
+                "4170a919dcc1282e"
+            ]
+        ]
+    },
+    {
+        "id": "7fbf93cec121c972",
+        "type": "ui_button",
+        "z": "57353fb1ead59d3e",
+        "name": "Alle Lichtgruppen ausschalten",
+        "group": "afcacc8ef8574799",
+        "order": 30,
+        "width": 9,
+        "height": 1,
+        "passthru": false,
+        "label": "ALLES AUS",
+        "tooltip": "Schaltet alle aktiven und unbekannten Lichtgruppen wie der jeweilige Gruppen-Toggle aus",
+        "color": "#ffffff",
+        "bgcolor": "#b71c1c",
+        "className": "",
+        "icon": "fa-power-off",
+        "payload": "0",
+        "payloadType": "num",
+        "topic": "alloff",
+        "topicType": "str",
+        "x": 270,
+        "y": 1440,
+        "wires": [
+            [
+                "752ca20754144690"
+            ]
+        ]
+    },
+    {
+        "id": "afcacc8ef8574799",
+        "type": "ui_group",
+        "name": "switch",
+        "tab": "e6239b8509a8543a",
+        "order": 1,
+        "disp": true,
+        "width": 9,
+        "collapse": false,
+        "className": ""
+    },
+    {
+        "id": "e6239b8509a8543a",
+        "type": "ui_tab",
+        "name": "Licht",
+        "icon": "fa-lightbulb-o",
+        "order": 17,
+        "disabled": false,
+        "hidden": false
+    },
+    {
+        "id": "12c8e682dd7a5c81",
+        "type": "global-config",
+        "env": [],
+        "modules": {
+            "node-red-dashboard": "3.6.6",
+            "node-red-contrib-ui-led": "0.4.11",
+            "@signalk/node-red-embedded": "2.21.0"
+        }
+    },
+    {
+        "id": "61ac83480431e31b",
+        "type": "catch",
+        "z": "57353fb1ead59d3e",
+        "name": "",
+        "scope": null,
+        "uncaught": false,
+        "x": 80,
+        "y": 1840,
+        "wires": [
+            [
+                "2f3d697c09951a8f"
+            ]
+        ]
+    },
+    {
+        "id": "2f3d697c09951a8f",
+        "type": "debug",
+        "z": "57353fb1ead59d3e",
+        "name": "Fehler Licht",
+        "active": false,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "true",
+        "targetType": "full",
+        "x": 290,
+        "y": 1840,
+        "wires": []
+    },
+    {
+        "id": "a197f7b3304881be",
+        "type": "signalk-subscribe",
+        "z": "57353fb1ead59d3e",
+        "name": "night mode",
+        "mode": "sendAll",
+        "flatten": false,
+        "context": "vessels.self",
+        "path": "environment.mode",
+        "source": "",
+        "period": "1000",
+        "x": 1450,
+        "y": 80,
+        "wires": [
+            [
+                "1bf547ddea1c1176"
+            ]
+        ],
+        "g": "34e6df38f912701e"
+    },
+    {
+        "id": "1bf547ddea1c1176",
+        "type": "function",
+        "z": "57353fb1ead59d3e",
+        "name": "SignalK -> flow.nightMode.dateTime (file)",
+        "action": "",
+        "property": "",
+        "reg": false,
+        "x": 1740,
+        "y": 80,
+        "wires": [
+            [
+                "82091fd51e64dc70"
+            ]
+        ],
+        "func": "const nm = flow.get(\"nightMode\", \"file\") || {};\nnm.dateTime = msg.payload;\nflow.set(\"nightMode\", nm, \"file\");\nreturn {topic:\"poll\"};",
+        "outputs": 1,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": []
+    },
+    {
+        "id": "620533f4dcdb5b80",
+        "type": "inject",
+        "z": "57353fb1ead59d3e",
+        "name": "EINMALIG: Licht-Konfiguration initialisieren",
+        "props": [
+            {
+                "p": "payload"
+            }
+        ],
+        "repeat": "",
+        "crontab": "",
+        "once": false,
+        "onceDelay": 0.1,
+        "topic": "",
+        "payload": "true",
+        "payloadType": "bool",
+        "x": 180,
+        "y": 1640,
+        "wires": [
+            [
+                "33d5449b0566a150"
+            ]
+        ]
+    },
+    {
+        "id": "33d5449b0566a150",
+        "type": "function",
+        "z": "57353fb1ead59d3e",
+        "name": "Initialisierung flow.lights (file) – nur wenn leer",
+        "func": "// Einmalige Initialisierung (manuell ausloesen). Bestehende Daten schuetzen.\nconst existing = flow.get(\"lights\", \"file\");\nif (existing && existing.config && Object.keys(existing.config).length) {\n    node.warn(\"flow.lights.config existiert bereits: keine Aenderung vorgenommen.\");\n    return {payload:\"Bereits initialisiert – nichts ueberschrieben\"};\n}\nconst config = {\"innen\":{\"config group\":{\"area\":\"innen\",\"type\":\"rgb\",\"fade speed\":2000,\"max brightness\":100,\"config segments\":[{\"name\":\"schwalbennest bb\",\"channels\":{\"r\":{\"channel\":22,\"maxbright\":100,\"auto brightness\":60,\"on delay\":0,\"off delay\":0},\"g\":{\"channel\":23,\"maxbright\":100,\"auto brightness\":60,\"on delay\":2500,\"off delay\":0},\"b\":{\"channel\":24,\"maxbright\":100,\"auto brightness\":60,\"on delay\":2500,\"off delay\":0},\"w\":{\"channel\":null,\"maxbright\":70,\"auto brightness\":0,\"on delay\":0,\"off delay\":0},\"ww\":{\"channel\":null,\"maxbright\":70,\"auto brightness\":35,\"on delay\":0,\"off delay\":0}}},{\"name\":\"schwalbennest stb\",\"channels\":{\"r\":{\"channel\":33,\"maxbright\":100,\"auto brightness\":60,\"on delay\":2500,\"off delay\":0},\"g\":{\"channel\":32,\"maxbright\":100,\"auto brightness\":60,\"on delay\":0,\"off delay\":0},\"b\":{\"channel\":34,\"maxbright\":100,\"auto brightness\":60,\"on delay\":2500,\"off delay\":0},\"w\":{\"channel\":null,\"maxbright\":100,\"auto brightness\":35,\"on delay\":0,\"off delay\":0},\"ww\":{\"channel\":null,\"maxbright\":100,\"auto brightness\":35,\"on delay\":0,\"off delay\":0}}},{\"name\":\"mastdurchlass bb\",\"channels\":{\"r\":{\"channel\":41,\"maxbright\":100,\"auto brightness\":90,\"on delay\":0,\"off delay\":0},\"g\":{\"channel\":42,\"maxbright\":100,\"auto brightness\":90,\"on delay\":2500,\"off delay\":0},\"b\":{\"channel\":43,\"maxbright\":100,\"auto brightness\":90,\"on delay\":2500,\"off delay\":0},\"w\":{\"channel\":null,\"maxbright\":70,\"auto brightness\":35,\"on delay\":0,\"off delay\":0},\"ww\":{\"channel\":null,\"maxbright\":70,\"auto brightness\":35,\"on delay\":0,\"off delay\":0}}},{\"name\":\"mastdurchlass stb\",\"channels\":{\"r\":{\"channel\":44,\"maxbright\":100,\"auto brightness\":90,\"on delay\":2500,\"off delay\":0},\"g\":{\"channel\":45,\"maxbright\":100,\"auto brightness\":90,\"on delay\":0,\"off delay\":0},\"b\":{\"channel\":46,\"maxbright\":100,\"auto brightness\":90,\"on delay\":2500,\"off delay\":0},\"w\":{\"channel\":null,\"maxbright\":70,\"auto brightness\":35,\"on delay\":0,\"off delay\":0},\"ww\":{\"channel\":null,\"maxbright\":70,\"auto brightness\":35,\"on delay\":0,\"off delay\":0}}},{\"name\":\"niedergang\",\"channels\":{\"r\":{\"channel\":35,\"maxbright\":100,\"auto brightness\":90,\"on delay\":0,\"off delay\":0},\"g\":{\"channel\":36,\"maxbright\":100,\"auto brightness\":90,\"on delay\":0,\"off delay\":0},\"b\":{\"channel\":37,\"maxbright\":100,\"auto brightness\":90,\"on delay\":0,\"off delay\":0},\"w\":{\"channel\":null,\"maxbright\":100,\"auto brightness\":35,\"on delay\":0,\"off delay\":0},\"ww\":{\"channel\":null,\"maxbright\":70,\"auto brightness\":35,\"on delay\":0,\"off delay\":0}}},{\"name\":\"decke mitte\",\"channels\":{\"r\":{\"channel\":25,\"maxbright\":100,\"auto brightness\":60,\"on delay\":2500,\"off delay\":0},\"g\":{\"channel\":26,\"maxbright\":100,\"auto brightness\":60,\"on delay\":2500,\"off delay\":0},\"b\":{\"channel\":27,\"maxbright\":100,\"auto brightness\":60,\"on delay\":2500,\"off delay\":0},\"w\":{\"channel\":null,\"maxbright\":70,\"auto brightness\":35,\"on delay\":0,\"off delay\":0},\"ww\":{\"channel\":null,\"maxbright\":70,\"auto brightness\":35,\"on delay\":0,\"off delay\":0}}},{\"name\":\"decke mitte2\",\"channels\":{\"r\":{\"channel\":19,\"maxbright\":100,\"auto brightness\":60,\"on delay\":2500,\"off delay\":0},\"g\":{\"channel\":20,\"maxbright\":100,\"auto brightness\":60,\"on delay\":2500,\"off delay\":0},\"b\":{\"channel\":21,\"maxbright\":100,\"auto brightness\":60,\"on delay\":2500,\"off delay\":0},\"w\":{\"channel\":null,\"maxbright\":70,\"auto brightness\":35,\"on delay\":0,\"off delay\":0},\"ww\":{\"channel\":null,\"maxbright\":70,\"auto brightness\":35,\"on delay\":0,\"off delay\":0}}},{\"name\":\"decke bug\",\"channels\":{\"r\":{\"channel\":28,\"maxbright\":100,\"auto brightness\":80,\"on delay\":2500,\"off delay\":0},\"g\":{\"channel\":29,\"maxbright\":100,\"auto brightness\":80,\"on delay\":2500,\"off delay\":0},\"b\":{\"channel\":30,\"maxbright\":100,\"auto brightness\":80,\"on delay\":2500,\"off delay\":0},\"w\":{\"channel\":null,\"maxbright\":70,\"auto brightness\":35,\"on delay\":0,\"off delay\":0},\"ww\":{\"channel\":null,\"maxbright\":70,\"auto brightness\":35,\"on delay\":0,\"off delay\":0}}}]},\"status\":\"off\",\"mode\":\"toggle\"},\"aussen\":{\"config group\":{\"area\":\"aussen\",\"type\":\"rgb\",\"fade speed\":1000,\"max brightness\":100,\"config segments\":[{\"name\":\"traveller\",\"channels\":{\"r\":{\"channel\":38,\"maxbright\":100,\"auto brightness\":35,\"on delay\":0,\"off delay\":0},\"g\":{\"channel\":39,\"maxbright\":100,\"auto brightness\":35,\"on delay\":0,\"off delay\":0},\"b\":{\"channel\":40,\"maxbright\":100,\"auto brightness\":30,\"on delay\":0,\"off delay\":0},\"w\":{\"channel\":null,\"maxbright\":70,\"auto brightness\":35,\"on delay\":0,\"off delay\":0},\"ww\":{\"channel\":null,\"maxbright\":70,\"auto brightness\":35,\"on delay\":0,\"off delay\":0}}},{\"name\":\"reserve\",\"channels\":{\"r\":{\"channel\":null,\"maxbright\":70,\"auto brightness\":35,\"on delay\":0,\"off delay\":0},\"g\":{\"channel\":null,\"maxbright\":70,\"auto brightness\":35,\"on delay\":0,\"off delay\":0},\"b\":{\"channel\":null,\"maxbright\":70,\"auto brightness\":35,\"on delay\":0,\"off delay\":0},\"w\":{\"channel\":null,\"maxbright\":70,\"auto brightness\":35,\"on delay\":0,\"off delay\":0},\"ww\":{\"channel\":null,\"maxbright\":70,\"auto brightness\":35,\"on delay\":0,\"off delay\":0}}}]},\"status\":\"off\",\"mode\":\"toggle\"},\"mast\":{\"config group\":{\"area\":\"mast\",\"type\":\"unicolor\",\"fade speed\":1000,\"max brightness\":50,\"config segments\":[{\"name\":\"Saling1Bb\",\"channels\":{\"r\":{\"channel\":null,\"maxbright\":70,\"auto brightness\":35,\"on delay\":0,\"off delay\":0},\"g\":{\"channel\":null,\"maxbright\":70,\"auto brightness\":35,\"on delay\":0,\"off delay\":0},\"b\":{\"channel\":null,\"maxbright\":70,\"auto brightness\":35,\"on delay\":0,\"off delay\":0},\"w\":{\"channel\":5,\"maxbright\":50,\"auto brightness\":10,\"on delay\":0,\"off delay\":0},\"ww\":{\"channel\":null,\"maxbright\":70,\"auto brightness\":35,\"on delay\":0,\"off delay\":0}}},{\"name\":\"Saling1Stb\",\"channels\":{\"r\":{\"channel\":null,\"maxbright\":70,\"auto brightness\":35,\"on delay\":0,\"off delay\":0},\"g\":{\"channel\":null,\"maxbright\":70,\"auto brightness\":35,\"on delay\":0,\"off delay\":0},\"b\":{\"channel\":null,\"maxbright\":70,\"auto brightness\":35,\"on delay\":0,\"off delay\":0},\"w\":{\"channel\":6,\"maxbright\":50,\"auto brightness\":10,\"on delay\":0,\"off delay\":0},\"ww\":{\"channel\":null,\"maxbright\":70,\"auto brightness\":35,\"on delay\":0,\"off delay\":0}}},{\"name\":\"Saling2Bb\",\"channels\":{\"r\":{\"channel\":null,\"maxbright\":70,\"auto brightness\":35,\"on delay\":0,\"off delay\":0},\"g\":{\"channel\":null,\"maxbright\":70,\"auto brightness\":35,\"on delay\":0,\"off delay\":0},\"b\":{\"channel\":null,\"maxbright\":70,\"auto brightness\":35,\"on delay\":0,\"off delay\":0},\"w\":{\"channel\":3,\"maxbright\":50,\"auto brightness\":10,\"on delay\":500,\"off delay\":0},\"ww\":{\"channel\":null,\"maxbright\":70,\"auto brightness\":35,\"on delay\":0,\"off delay\":0}}},{\"name\":\"Saling2Stb\",\"channels\":{\"r\":{\"channel\":null,\"maxbright\":70,\"auto brightness\":35,\"on delay\":0,\"off delay\":0},\"g\":{\"channel\":null,\"maxbright\":70,\"auto brightness\":35,\"on delay\":0,\"off delay\":0},\"b\":{\"channel\":null,\"maxbright\":70,\"auto brightness\":35,\"on delay\":0,\"off delay\":0},\"w\":{\"channel\":8,\"maxbright\":50,\"auto brightness\":10,\"on delay\":500,\"off delay\":0},\"ww\":{\"channel\":null,\"maxbright\":70,\"auto brightness\":35,\"on delay\":0,\"off delay\":0}}},{\"name\":\"Saling3Bb\",\"channels\":{\"r\":{\"channel\":null,\"maxbright\":70,\"auto brightness\":35,\"on delay\":0,\"off delay\":0},\"g\":{\"channel\":null,\"maxbright\":70,\"auto brightness\":35,\"on delay\":0,\"off delay\":0},\"b\":{\"channel\":null,\"maxbright\":70,\"auto brightness\":35,\"on delay\":0,\"off delay\":0},\"w\":{\"channel\":2,\"maxbright\":50,\"auto brightness\":10,\"on delay\":1000,\"off delay\":0},\"ww\":{\"channel\":null,\"maxbright\":70,\"auto brightness\":35,\"on delay\":0,\"off delay\":0}}},{\"name\":\"Saling3Stb\",\"channels\":{\"r\":{\"channel\":null,\"maxbright\":70,\"auto brightness\":35,\"on delay\":0,\"off delay\":0},\"g\":{\"channel\":null,\"maxbright\":70,\"auto brightness\":35,\"on delay\":0,\"off delay\":0},\"b\":{\"channel\":null,\"maxbright\":70,\"auto brightness\":35,\"on delay\":0,\"off delay\":0},\"w\":{\"channel\":1,\"maxbright\":50,\"auto brightness\":10,\"on delay\":1000,\"off delay\":0},\"ww\":{\"channel\":null,\"maxbright\":70,\"auto brightness\":35,\"on delay\":0,\"off delay\":0}}},{\"name\":\"Toplicht\",\"channels\":{\"r\":{\"channel\":null,\"maxbright\":70,\"auto brightness\":35,\"on delay\":0,\"off delay\":0},\"g\":{\"channel\":null,\"maxbright\":70,\"auto brightness\":35,\"on delay\":0,\"off delay\":0},\"b\":{\"channel\":null,\"maxbright\":70,\"auto brightness\":35,\"on delay\":0,\"off delay\":0},\"w\":{\"channel\":0,\"maxbright\":70,\"auto brightness\":15,\"on delay\":1500,\"off delay\":0},\"ww\":{\"channel\":null,\"maxbright\":70,\"auto brightness\":35,\"on delay\":0,\"off delay\":0}}}]},\"status\":\"off\",\"mode\":\"toggle\"},\"position\":{\"config group\":{\"area\":\"position\",\"type\":\"unicolor\",\"fade speed\":1000,\"max brightness\":30,\"config segments\":[{\"name\":\"PositionslichtBb\",\"channels\":{\"r\":{\"channel\":13,\"maxbright\":30,\"auto brightness\":20,\"on delay\":0,\"off delay\":0},\"g\":{\"channel\":null,\"maxbright\":30,\"auto brightness\":20,\"on delay\":0,\"off delay\":0},\"b\":{\"channel\":null,\"maxbright\":70,\"auto brightness\":35,\"on delay\":0,\"off delay\":0},\"w\":{\"channel\":null,\"maxbright\":70,\"auto brightness\":35,\"on delay\":0,\"off delay\":0},\"ww\":{\"channel\":null,\"maxbright\":70,\"auto brightness\":35,\"on delay\":0,\"off delay\":0}}},{\"name\":\"PositionslichtStb\",\"channels\":{\"r\":{\"channel\":null,\"maxbright\":0,\"auto brightness\":0,\"on delay\":0,\"off delay\":0},\"g\":{\"channel\":12,\"maxbright\":30,\"auto brightness\":7,\"on delay\":0,\"off delay\":0},\"b\":{\"channel\":null,\"maxbright\":70,\"auto brightness\":35,\"on delay\":0,\"off delay\":0},\"w\":{\"channel\":null,\"maxbright\":70,\"auto brightness\":35,\"on delay\":0,\"off delay\":0},\"ww\":{\"channel\":null,\"maxbright\":70,\"auto brightness\":35,\"on delay\":0,\"off delay\":0}}}]},\"status\":\"off\",\"mode\":\"toggle\"},\"top\":{\"config group\":{\"area\":\"top\",\"type\":\"unicolor\",\"fade speed\":1000,\"max brightness\":70,\"config segments\":[{\"name\":\"toplicht\",\"channels\":{\"r\":{\"channel\":null,\"maxbright\":70,\"auto brightness\":35,\"on delay\":0,\"off delay\":0},\"g\":{\"channel\":null,\"maxbright\":70,\"auto brightness\":35,\"on delay\":0,\"off delay\":0},\"b\":{\"channel\":null,\"maxbright\":70,\"auto brightness\":35,\"on delay\":0,\"off delay\":0},\"w\":{\"channel\":0,\"maxbright\":70,\"auto brightness\":15,\"on delay\":0,\"off delay\":0},\"ww\":{\"channel\":null,\"maxbright\":70,\"auto brightness\":35,\"on delay\":0,\"off delay\":0}}}]},\"status\":\"off\",\"mode\":\"toggle\"},\"achtern\":{\"config group\":{\"area\":\"achtern\",\"type\":\"unicolor\",\"fade speed\":1000,\"max brightness\":30,\"config segments\":[{\"name\":\"achterlicht\",\"channels\":{\"r\":{\"channel\":null,\"maxbright\":70,\"auto brightness\":35,\"on delay\":0,\"off delay\":0},\"g\":{\"channel\":null,\"maxbright\":70,\"auto brightness\":35,\"on delay\":0,\"off delay\":0},\"b\":{\"channel\":null,\"maxbright\":70,\"auto brightness\":35,\"on delay\":0,\"off delay\":0},\"w\":{\"channel\":14,\"maxbright\":25,\"auto brightness\":3,\"on delay\":0,\"off delay\":0},\"ww\":{\"channel\":null,\"maxbright\":70,\"auto brightness\":35,\"on delay\":0,\"off delay\":0}}}]},\"status\":\"off\",\"mode\":\"toggle\"},\"unterwasser\":{\"config group\":{\"area\":\"unterwasser\",\"type\":\"unicolor\",\"fade speed\":1000,\"max brightness\":60,\"config segments\":[{\"name\":\"unterwasser bb\",\"channels\":{\"r\":{\"channel\":null,\"maxbright\":0,\"auto brightness\":0,\"on delay\":0,\"off delay\":0},\"g\":{\"channel\":null,\"maxbright\":70,\"auto brightness\":35,\"on delay\":0,\"off delay\":0},\"b\":{\"channel\":null,\"maxbright\":70,\"auto brightness\":35,\"on delay\":0,\"off delay\":0},\"w\":{\"channel\":null,\"maxbright\":20,\"auto brightness\":5,\"on delay\":0,\"off delay\":0},\"ww\":{\"channel\":15,\"maxbright\":70,\"auto brightness\":30,\"on delay\":0,\"off delay\":0}}},{\"name\":\"unterwasser stb\",\"channels\":{\"r\":{\"channel\":null,\"maxbright\":70,\"auto brightness\":35,\"on delay\":0,\"off delay\":0},\"g\":{\"channel\":null,\"maxbright\":70,\"auto brightness\":35,\"on delay\":0,\"off delay\":0},\"b\":{\"channel\":null,\"maxbright\":70,\"auto brightness\":35,\"on delay\":0,\"off delay\":0},\"w\":{\"channel\":null,\"maxbright\":20,\"auto brightness\":5,\"on delay\":0,\"off delay\":0},\"ww\":{\"channel\":15,\"maxbright\":50,\"auto brightness\":30,\"on delay\":0,\"off delay\":0}}}]},\"status\":\"off\",\"mode\":\"toggle\"}};\nconst lights = existing && typeof existing === \"object\" ? existing : {};\nlights.config = config;\nlights.status = lights.status || {};\nlights.status.channels = lights.status.channels || {};\nflow.set(\"lights\",lights,\"file\");\nnode.status({fill:\"green\",shape:\"dot\",text:\"Konfiguration initialisiert\"});\nreturn {payload:\"Initialisiert: \" + Object.keys(config).length + \" Lichtgruppen; status.channels leer\"};",
+        "outputs": 1,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 530,
+        "y": 1640,
+        "wires": [
+            [
+                "b6a8f9bc2e3887ff"
+            ]
+        ]
+    },
+    {
+        "id": "b6a8f9bc2e3887ff",
+        "type": "debug",
+        "z": "57353fb1ead59d3e",
+        "name": "Initialisierung Ergebnis",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "payload",
+        "targetType": "msg",
+        "x": 810,
+        "y": 80,
+        "wires": []
+    },
+    {
+        "id": "82091fd51e64dc70",
+        "type": "function",
+        "name": "RGB Nachtmodus – Automatik / Manuell",
+        "func": "// Nachtmodus ausschließlich unter flow.nightMode (file).\n// SignalK: flow.nightMode.dateTime.updates[0].values[0].value (day/night)\n// Hafen: global.BoatState.atHabour (memory; inside/outside)\n// Ausgang 1: night_apply an Innen/Aussen. Ausgang 2: Dashboard.\nconst FILE = \"file\", MEMORY = \"memory\";\nconst nm = flow.get(\"nightMode\", FILE) || {};\nif (![\"auto\", \"on\", \"off\"].includes(nm.mode)) nm.mode = \"auto\";\nif (typeof nm.active !== \"boolean\") nm.active = false;\nif (typeof nm.resolved !== \"boolean\") nm.resolved = false;\nconst before = nm.active;\nconst previousNight = nm.signalK;\nconst previousHarbor = nm.inHarbor;\nconst raw = nm.dateTime?.updates?.[0]?.values?.[0]?.value;\nconst dayNight = String(raw ?? \"\").trim().toLowerCase();\nnm.signalK = [\"day\", \"night\"].includes(dayNight) ? dayNight : \"unknown\";\nconst boat = global.get(\"BoatState\", MEMORY);\nconst place = String(boat?.atHabour ?? \"\").trim().toLowerCase();\nnm.inHarbor = place === \"inside\" ? true : place === \"outside\" ? false : null;\nconst nightChanged = nm.signalK !== previousNight;\nconst harborChanged = nm.inHarbor !== previousHarbor;\nconst topic = String(msg.topic || \"\").trim().toLowerCase();\nlet cause = \"refresh\";\nconst manual = topic === \"night_cycle\";\nif (manual) {\n    nm.mode = nm.mode === \"auto\" ? \"on\" : nm.mode === \"on\" ? \"off\" : \"auto\";\n    cause = \"manual\";\n} else if (![\"\", \"poll\", \"refresh\", \"refresh_night\", \"signalk\", \"harbor_update\"].includes(topic)) return null;\nif (!manual) {\n    if (nightChanged) cause = \"signalk\";\n    else if (harborChanged) cause = \"harbor\";\n}\nlet target = null;\nif (nm.mode === \"on\") target = true;\nelse if (nm.mode === \"off\") target = false;\nelse if (nm.signalK === \"day\") target = false;\nelse if (nm.signalK === \"night\" && nm.inHarbor !== null) target = !nm.inHarbor;\nlet changed = false, fadeMs = 0;\nif (target !== null) {\n    changed = !nm.resolved || target !== before;\n    nm.active = target;\n    nm.resolved = true;\n    if (changed) {\n        fadeMs = manual ? 1000 : cause === \"harbor\" ? 10000 : 60000;\n        nm.lastTransition = {cause, fadeMs, active:nm.active, timestamp:new Date().toISOString()};\n    }\n}\nflow.set(\"nightMode\", nm, FILE);\nconst modeLabel = nm.mode === \"auto\" ? \"AUTO\" : nm.mode === \"on\" ? \"NACHT EIN\" : \"NACHT AUS\";\nconst effect = !nm.resolved ? \"unbekannt\" : nm.active ? \"nur Rot\" : \"RGB\";\nconst harbor = nm.inHarbor === null ? \"Hafen unbekannt\" : nm.inHarbor ? \"im Hafen\" : \"außerhalb Hafen\";\nconst label = `${modeLabel} | ${effect} | SignalK: ${nm.signalK} | ${harbor}`;\nnode.status({fill:!nm.resolved ? \"grey\" : nm.active ? \"yellow\" : \"green\", shape:\"dot\",text:label});\nconst text = {payload:label};\nif (!changed) return [null,text];\nreturn [{topic:\"night_apply\",payload:{night:nm.active,fadeMs,cause}},text];",
+        "outputs": 2,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 1800,
+        "y": 120,
+        "wires": [
+            [
+                "3bc167dfa7f6eb5c",
+                "39aed34799585e2e"
+            ],
+            [
+                "70ae593141f19a4e"
+            ]
+        ],
+        "z": "57353fb1ead59d3e",
+        "g": "34e6df38f912701e"
+    },
+    {
+        "id": "e8f00062539e8c11",
+        "type": "ui_button",
+        "name": "Nachtmodus umschalten",
+        "group": "afcacc8ef8574799",
+        "order": 31,
+        "width": 3,
+        "height": 1,
+        "passthru": false,
+        "label": "Nachtmodus wechseln",
+        "tooltip": "Wechselt AUTO → NACHT EIN → NACHT AUS → AUTO; manuelle Umschaltung 1 Sekunde",
+        "color": "#ffffff",
+        "bgcolor": "#34495e",
+        "className": "",
+        "icon": "fa-moon-o",
+        "payload": "1",
+        "payloadType": "num",
+        "topic": "night_cycle",
+        "topicType": "str",
+        "x": 1490,
+        "y": 120,
+        "wires": [
+            [
+                "82091fd51e64dc70"
+            ]
+        ],
+        "z": "57353fb1ead59d3e",
+        "g": "34e6df38f912701e"
+    },
+    {
+        "id": "70ae593141f19a4e",
+        "type": "ui_text",
+        "name": "Nachtmodus-Status",
+        "group": "afcacc8ef8574799",
+        "order": 32,
+        "width": 6,
+        "height": 1,
+        "label": "Nachtmodus",
+        "format": "{{msg.payload}}",
+        "layout": "row-spread",
+        "className": "",
+        "x": 2100,
+        "y": 120,
+        "wires": [],
+        "z": "57353fb1ead59d3e",
+        "g": "34e6df38f912701e"
+    },
+    {
+        "id": "34e6df38f912701e",
+        "type": "group",
+        "z": "57353fb1ead59d3e",
+        "name": "nightMode",
+        "style": {
+            "label": true
+        },
+        "nodes": [
+            "a197f7b3304881be",
+            "1bf547ddea1c1176",
+            "82091fd51e64dc70",
+            "e8f00062539e8c11",
+            "3bc167dfa7f6eb5c",
+            "70ae593141f19a4e",
+            "39aed34799585e2e"
+        ],
+        "x": 1354,
+        "y": 39,
+        "w": 872,
+        "h": 122
+    },
+    {
+        "id": "3bc167dfa7f6eb5c",
+        "type": "link out",
+        "z": "57353fb1ead59d3e",
+        "g": "34e6df38f912701e",
+        "name": "nightMode",
+        "mode": "link",
+        "links": [
+            "1239c847cf3acece",
+            "7dc95e4abe71922e"
+        ],
+        "x": 2015,
+        "y": 80,
+        "wires": []
+    },
+    {
+        "id": "39aed34799585e2e",
+        "type": "debug",
+        "z": "57353fb1ead59d3e",
+        "g": "34e6df38f912701e",
+        "name": "debug 21",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "false",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 2120,
+        "y": 80,
+        "wires": []
+    },
+    {
+        "id": "ce934d58b844946f",
+        "type": "debug",
+        "z": "57353fb1ead59d3e",
+        "name": "debug 20",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "false",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 780,
+        "y": 140,
+        "wires": []
+    },
+    {
+        "id": "752ca20754144690",
+        "type": "link out",
+        "z": "57353fb1ead59d3e",
+        "name": "allOff",
+        "mode": "link",
+        "links": [
+            "1239c847cf3acece",
+            "2891c0910cadf2db",
+            "51d61cc76d423971",
+            "7dc95e4abe71922e",
+            "d902ba33904a65a1",
+            "e10d1d1e84bd58f8",
+            "f243846d8323ada1"
+        ],
+        "x": 445,
+        "y": 1440,
+        "wires": []
+    },
+    {
+        "id": "69b56c60c4d189b9",
+        "type": "link out",
+        "z": "57353fb1ead59d3e",
+        "name": "reconnectState",
+        "mode": "link",
+        "links": [
+            "1239c847cf3acece",
+            "7dc95e4abe71922e",
+            "2891c0910cadf2db",
+            "e10d1d1e84bd58f8",
+            "d902ba33904a65a1",
+            "51d61cc76d423971",
+            "f243846d8323ada1"
+        ],
+        "x": 725,
+        "y": 1600,
+        "wires": []
+    },
+    {
+        "id": "4170a919dcc1282e",
+        "type": "link out",
+        "z": "57353fb1ead59d3e",
+        "name": "refreshRestart",
+        "mode": "link",
+        "links": [
+            "1239c847cf3acece",
+            "2891c0910cadf2db",
+            "51d61cc76d423971",
+            "7dc95e4abe71922e",
+            "d902ba33904a65a1",
+            "e10d1d1e84bd58f8",
+            "f243846d8323ada1"
+        ],
+        "x": 725,
+        "y": 1680,
+        "wires": []
+    },
+    {
+        "id": "1239c847cf3acece",
+        "type": "link in",
+        "z": "57353fb1ead59d3e",
+        "name": "link in 1",
+        "links": [
+            "3bc167dfa7f6eb5c",
+            "69b56c60c4d189b9",
+            "4170a919dcc1282e",
+            "752ca20754144690"
+        ],
+        "x": 415,
+        "y": 160,
+        "wires": [
+            [
+                "99cef3b690e02c7e"
+            ]
+        ]
+    },
+    {
+        "id": "7dc95e4abe71922e",
+        "type": "link in",
+        "z": "57353fb1ead59d3e",
+        "name": "link in 2",
+        "links": [
+            "3bc167dfa7f6eb5c",
+            "69b56c60c4d189b9",
+            "4170a919dcc1282e",
+            "752ca20754144690"
+        ],
+        "x": 385,
+        "y": 360,
+        "wires": [
+            [
+                "153af5322b63508f"
+            ]
+        ]
+    },
+    {
+        "id": "2891c0910cadf2db",
+        "type": "link in",
+        "z": "57353fb1ead59d3e",
+        "name": "link in 3",
+        "links": [
+            "69b56c60c4d189b9",
+            "4170a919dcc1282e",
+            "752ca20754144690"
+        ],
+        "x": 385,
+        "y": 540,
+        "wires": [
+            [
+                "8cd9cda73b291648"
+            ]
+        ]
+    },
+    {
+        "id": "e10d1d1e84bd58f8",
+        "type": "link in",
+        "z": "57353fb1ead59d3e",
+        "name": "link in 4",
+        "links": [
+            "69b56c60c4d189b9",
+            "4170a919dcc1282e",
+            "752ca20754144690"
+        ],
+        "x": 385,
+        "y": 720,
+        "wires": [
+            [
+                "1ddf4011356b8474"
+            ]
+        ]
+    },
+    {
+        "id": "d902ba33904a65a1",
+        "type": "link in",
+        "z": "57353fb1ead59d3e",
+        "name": "link in 5",
+        "links": [
+            "69b56c60c4d189b9",
+            "4170a919dcc1282e",
+            "752ca20754144690"
+        ],
+        "x": 395,
+        "y": 900,
+        "wires": [
+            [
+                "1f95a14c14b0bb9b"
+            ]
+        ]
+    },
+    {
+        "id": "51d61cc76d423971",
+        "type": "link in",
+        "z": "57353fb1ead59d3e",
+        "name": "link in 6",
+        "links": [
+            "69b56c60c4d189b9",
+            "4170a919dcc1282e",
+            "752ca20754144690"
+        ],
+        "x": 385,
+        "y": 1080,
+        "wires": [
+            [
+                "329838acef25e40b"
+            ]
+        ]
+    },
+    {
+        "id": "f243846d8323ada1",
+        "type": "link in",
+        "z": "57353fb1ead59d3e",
+        "name": "link in 7",
+        "links": [
+            "69b56c60c4d189b9",
+            "4170a919dcc1282e",
+            "752ca20754144690"
+        ],
+        "x": 375,
+        "y": 1260,
+        "wires": [
+            [
+                "a29b491a48992886"
+            ]
+        ]
+    }
+]
