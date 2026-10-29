@@ -14,6 +14,7 @@ aktiven Hard-STOP und die Rückmeldung der tatsächlich aktiven Steuerquelle.
 | **STOP (HARD)** | Beendet den Tempomaten und fordert aktive Motorbremsung an, auch bei ausgeschalteter Node-RED-Freigabe. |
 | **Tempomat EIN/AUS** | Schaltet die automatische Geschwindigkeitsregelung ein oder aus. Ausschalten fordert Hard-STOP an. |
 | **Geschwindigkeit** | Sollgeschwindigkeit von 0 bis 4 kn in Schritten von 0,1 kn. |
+| **Reglerparameter** | Kp, Ki und Kd bearbeiten und mit **Übernehmen & speichern** gemeinsam anwenden. **Verwerfen** lädt die aktuell verwendeten Werte. |
 | **Tempomat-Status** | Zeigt Sollgeschwindigkeit, SOG, Stellwert, P-/I-/D-Anteile und Statusgrund. |
 | **Motor / Steuerquelle** | Zeigt den vom VESC angewendeten Modus, die gemessene Drehrichtung und die aktive Quelle Poti/WiFi. |
 | **Rpm / Temp FET** | Zeigt Propellerdrehzahl und Temperatur der Leistungselektronik. |
@@ -61,9 +62,27 @@ fordert Hard-STOP an; ein positiver Sollwert lässt ihn wieder regeln. Ein
 vom PID berechneter Ausgang von 0 % bei positivem Sollwert ist dagegen ein
 normaler Drehzahlsollwert, kein gesonderter Hard-STOP-Befehl.
 
-Die Reglerwerte stehen im Block `CFG` des Function-Knotens
-**Tempomat + Handbetrieb (PID, kn)**. Sie sind Startwerte für die Abstimmung
-auf dem Boot.
+### Reglerparameter anpassen
+
+Im Dashboard unter **Motor → Reglerparameter** stehen **Kp, Ki und Kd** als
+editierbare Zahlenfelder. Die aktiven Werte werden zusätzlich unter den
+Feldern angezeigt. Änderungen wirken erst nach **Übernehmen & speichern**;
+**Verwerfen** setzt den Eingabeentwurf zurück. Rückmeldungen überschreiben
+keine ungespeicherten Eingaben.
+
+Die Startwerte sind **Kp=100, Ki=5 und Kd=10**. Einstellbar sind Kp/Kd von
+0 bis 10.000 und Ki von 0 bis 1.000; die Einheiten stehen an den Feldern.
+Nullwerte sind zulässig. Die Grenzen sind Eingabegrenzen, keine am Boot
+abgestimmten Empfehlungen.
+
+Nach erfolgreichem Speichern werden die Werte im Datei-Kontext
+`vescCruiseConfig.pid` abgelegt und nach einem Neustart oder Deploy erneut
+geladen. Bei laufendem PID gelten Änderungen sofort; Integral und
+D-Filterzustand bleiben dabei erhalten. Speichern schaltet den Tempomaten
+nicht ein und hebt keine Potiübernahme auf.
+
+Die SOG- und D-Filterzeitkonstanten bleiben im Block `CFG` des Function-Knotens
+**Tempomat + Handbetrieb (PID, kn)** einstellbar.
 
 ## Hard-STOP und Poti-/WiFi-Übernahme
 
@@ -126,7 +145,7 @@ Ein aktiver Tempomat wird mit Hard-STOP-Anforderung beendet bei:
 
 Neue Daten schalten den Tempomaten nicht automatisch wieder ein.
 Nach Start/Deploy fordert Node-RED einmalig Hard-STOP an und der Tempomat
-bleibt aus. Nur die Sollgeschwindigkeit und die Motorfreigabe werden
+bleibt aus. Sollgeschwindigkeit, PID-Parameter und Motorfreigabe werden
 persistent gespeichert; der aktive Tempomat und sein Integrator nicht.
 
 Das LispBM-Script hält bei WiFi-Verbindungsabbruch den zuletzt angewendeten
@@ -144,7 +163,7 @@ Motorfreigabe beziehungsweise die gemeinsame Steuerungslogik.
 
 ## Voraussetzungen und Installation
 
-- Das passende [LispBM-Script auf CAN-ID 29](https://github.com/AndreasMulzer/Tronic250Vesc/blob/44b955e0317c07226e3c87c796da0ad2cee7f71e/LispBM/tronic250r.lisp) auf dem Tronic, nicht auf dem VESC Express.
+- Das passende [LispBM-Script auf CAN-ID 29](https://github.com/AndreasMulzer/Tronic250Vesc/blob/3e47ed474c19cf4932be07639b2685a33636fb86/LispBM/tronic250r.lisp) auf dem Tronic, nicht auf dem VESC Express.
 - Eine in Signal K eingebettete Node-RED-Instanz mit `node-red-dashboard` und `@signalk/node-red-embedded`.
 - Die Kontext-Stores `memory` und `file`, zum Beispiel:
 
@@ -167,8 +186,8 @@ das passende LispBM-Script installieren und den bisherigen VESC-Tab durch
 abwarten und die Node-RED-Motorfreigabe bei Bedarf einschalten.
 
 Der Flow entspricht unverändert dem Stand
-[Tronic250Vesc, Commit 44b955e](https://github.com/AndreasMulzer/Tronic250Vesc/tree/44b955e0317c07226e3c87c796da0ad2cee7f71e).
+[Tronic250Vesc, Commit 3e47ed4](https://github.com/AndreasMulzer/Tronic250Vesc/tree/3e47ed474c19cf4932be07639b2685a33636fb86).
 Weitere Details und Quellen stehen in der
-[zugehörigen Installationsanleitung](https://github.com/AndreasMulzer/Tronic250Vesc/blob/44b955e0317c07226e3c87c796da0ad2cee7f71e/docs/installation.md).
+[zugehörigen Installationsanleitung](https://github.com/AndreasMulzer/Tronic250Vesc/blob/3e47ed474c19cf4932be07639b2685a33636fb86/docs/installation.md).
 Die lokalen Softwareprüfungen belegen keine Installation, Bremskraft oder
 Regelgüte auf dem Boot.
