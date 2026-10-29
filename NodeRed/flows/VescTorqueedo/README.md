@@ -14,7 +14,7 @@ aktiven Hard-STOP und die Rückmeldung der tatsächlich aktiven Steuerquelle.
 | **STOP (HARD)** | Beendet den Tempomaten und fordert aktive Motorbremsung an, auch bei ausgeschalteter Node-RED-Freigabe. |
 | **Tempomat EIN/AUS** | Schaltet die automatische Geschwindigkeitsregelung ein oder aus. Ausschalten fordert Hard-STOP an. |
 | **Geschwindigkeit** | Sollgeschwindigkeit von 0 bis 4 kn in Schritten von 0,1 kn. |
-| **Reglerparameter** | Kp, Ki und Kd bearbeiten und mit **Übernehmen & speichern** gemeinsam anwenden. **Verwerfen** lädt die aktuell verwendeten Werte. |
+| **Reglerparameter** | Kp, Ki, Kd und SOG-Mittelwert-Fenster bearbeiten und mit **Übernehmen & speichern** gemeinsam anwenden. **Verwerfen** lädt die aktuell verwendeten Werte. |
 | **Tempomat-Status** | Zeigt Sollgeschwindigkeit, SOG, Stellwert, P-/I-/D-Anteile und Statusgrund. |
 | **Motor / Steuerquelle** | Zeigt den vom VESC angewendeten Modus, die gemessene Drehrichtung und die aktive Quelle Poti/WiFi. |
 | **Rpm / Temp FET** | Zeigt Propellerdrehzahl und Temperatur der Leistungselektronik. |
@@ -45,7 +45,8 @@ Drehzahlsollwert = begrenze(P + I + D, 0 %, 100 %)
 | Kp | 100 Prozentpunkte/kn |
 | Ki | 5 Prozentpunkte/(kn·s) |
 | Kd | 10 Prozentpunkte·s/kn |
-| SOG-Filter / D-Filter | jeweils 0,5 s |
+| SOG-Mittelwert | letzte 10 gültige GPS-Messwerte, einstellbar |
+| D-Filter | 0,5 s, nur für die SOG-Änderungsrate im D-Anteil |
 
 Beim Einschalten starten I und D bei null; der P-Anteil wirkt sofort.
 Mit diesen Werten führen beispielsweise **1 kn positive Abweichung sofort zu
@@ -62,9 +63,36 @@ fordert Hard-STOP an; ein positiver Sollwert lässt ihn wieder regeln. Ein
 vom PID berechneter Ausgang von 0 % bei positivem Sollwert ist dagegen ein
 normaler Drehzahlsollwert, kein gesonderter Hard-STOP-Befehl.
 
+### SOG glätten
+
+Der PID verwendet einen **gleitenden arithmetischen Mittelwert über die letzten
+10 gültigen SOG-Messwerte**. Der bisherige SOG-Tiefpass ist ersetzt. Jeder neue
+Quellzeitstempel zählt einmal; Regelticks, doppelte und ältere Messungen füllen
+das Fenster nicht. Bei vollem Fenster fällt der älteste Wert heraus. Beim
+Anlaufen wird nur durch die Anzahl der vorhandenen Werte geteilt; es werden
+keine Nullen ergänzt. Auch das Einschalten des PID verwendet diesen Mittelwert.
+
+Im Dashboard unter **Motor → Reglerparameter** lässt sich die Fenstergröße über
+**SOG-Mittelwert [Werte]** auf **1–100** einstellen und speichern. Bei kleinerem
+Fenster bleiben die neuesten Werte, ein größeres Fenster füllt sich mit neuen
+Messungen. Ein Fensterwechsel behält das Integral und setzt nur die D-Steigung
+zurück, damit kein künstlicher D-Stoß entsteht.
+
+Zehn Werte entsprechen bei 1 Hz ungefähr zehn Sekunden und bei 5 Hz ungefähr
+zwei Sekunden. Das verzögert auch echte Geschwindigkeitsänderungen; Fenster
+und PID-Verstärkungen sind deshalb gemeinsam auf dem Boot abzustimmen. Die
+bisherigen Verstärkungen werden beim Update nicht verändert.
+
+Ungültige SOG oder Quell-/Empfangslücken über 3 s löschen die Historie.
+Die Frischeprüfung gilt für die neueste Messung, nicht für jeden einzelnen
+Wert im Fenster. `navigation.speedOverGround` bleibt die rohe Sensorquelle.
+Statusanzeige und `controller.cruise.sogFiltered` zeigen den Mittelwert;
+die rohe SOG und die Anzahl der Fensterwerte werden getrennt angezeigt.
+Der vorhandene 0,5-s-Filter glättet nur noch den D-Anteil, nicht die SOG.
+
 ### Reglerparameter anpassen
 
-Im Dashboard unter **Motor → Reglerparameter** stehen **Kp, Ki und Kd** als
+Im Dashboard unter **Motor → Reglerparameter** stehen **Kp, Ki, Kd und die SOG-Fenstergröße** als
 editierbare Zahlenfelder. Die aktiven Werte werden zusätzlich unter den
 Feldern angezeigt. Änderungen wirken erst nach **Übernehmen & speichern**;
 **Verwerfen** setzt den Eingabeentwurf zurück. Rückmeldungen überschreiben
@@ -72,16 +100,16 @@ keine ungespeicherten Eingaben.
 
 Die Startwerte sind **Kp=100, Ki=5 und Kd=10**. Einstellbar sind Kp/Kd von
 0 bis 10.000 und Ki von 0 bis 1.000; die Einheiten stehen an den Feldern.
-Nullwerte sind zulässig. Die Grenzen sind Eingabegrenzen, keine am Boot
+Für Kp/Ki/Kd sind Nullwerte zulässig; die SOG-Fenstergröße muss ganzzahlig zwischen 1 und 100 liegen. Die Grenzen sind Eingabegrenzen, keine am Boot
 abgestimmten Empfehlungen.
 
 Nach erfolgreichem Speichern werden die Werte im Datei-Kontext
-`vescCruiseConfig.pid` abgelegt und nach einem Neustart oder Deploy erneut
+`vescCruiseConfig.pid` beziehungsweise `vescCruiseConfig.sogWindowSize` abgelegt und nach einem Neustart oder Deploy erneut
 geladen. Bei laufendem PID gelten Änderungen sofort; Integral und
-D-Filterzustand bleiben dabei erhalten. Speichern schaltet den Tempomaten
+bei reinen Kp-/Ki-/Kd-Änderungen auch der D-Filterzustand bleiben erhalten. Speichern schaltet den Tempomaten
 nicht ein und hebt keine Potiübernahme auf.
 
-Die SOG- und D-Filterzeitkonstanten bleiben im Block `CFG` des Function-Knotens
+Die separate D-Filterzeitkonstante bleibt im Block `CFG` des Function-Knotens
 **Tempomat + Handbetrieb (PID, kn)** einstellbar.
 
 ## Hard-STOP und Poti-/WiFi-Übernahme
@@ -123,6 +151,8 @@ Alle folgenden Pfade beginnen mit **`propulsion.torqeedo.`**:
 | `transmission.gear` | Richtung aus angewendetem Befehl: `Forward`, `Reverse`, `Neutral`, bei Fehler `Fault`; ohne Rückmeldung `null`. |
 | `controller.cruise.enabled` | Tempomat eingeschaltet. |
 | `controller.cruise.targetSpeed` / `controller.cruise.sog` | Sollgeschwindigkeit und aktuelle SOG in m/s. |
+| `controller.cruise.sogFiltered` | Vom PID verwendeter SOG-Mittelwert in m/s; bei alten Daten `null`. |
+| `controller.cruise.sogWindowSize` / `controller.cruise.sogSampleCount` | Eingestellte Fenstergröße und Anzahl aktuell gültiger Messwerte im Fenster. |
 | `controller.cruise.output` / `p` / `i` / `d` | Ausgang und PID-Anteile als Verhältnis; die letzten drei vollständigen Pfade sind `controller.cruise.p`, `.i` und `.d`. |
 | `controller.cruise.reason` | Status- oder Abschaltgrund des Tempomaten. |
 
@@ -145,7 +175,7 @@ Ein aktiver Tempomat wird mit Hard-STOP-Anforderung beendet bei:
 
 Neue Daten schalten den Tempomaten nicht automatisch wieder ein.
 Nach Start/Deploy fordert Node-RED einmalig Hard-STOP an und der Tempomat
-bleibt aus. Sollgeschwindigkeit, PID-Parameter und Motorfreigabe werden
+bleibt aus. Sollgeschwindigkeit, PID-Parameter, SOG-Fenstergröße und Motorfreigabe werden
 persistent gespeichert; der aktive Tempomat und sein Integrator nicht.
 
 Das LispBM-Script hält bei WiFi-Verbindungsabbruch den zuletzt angewendeten
@@ -163,7 +193,7 @@ Motorfreigabe beziehungsweise die gemeinsame Steuerungslogik.
 
 ## Voraussetzungen und Installation
 
-- Das passende [LispBM-Script auf CAN-ID 29](https://github.com/AndreasMulzer/Tronic250Vesc/blob/3e47ed474c19cf4932be07639b2685a33636fb86/LispBM/tronic250r.lisp) auf dem Tronic, nicht auf dem VESC Express.
+- Das passende [LispBM-Script auf CAN-ID 29](https://github.com/AndreasMulzer/Tronic250Vesc/blob/158e0ef7148bc52e55932e95a71c35036aa9448c/LispBM/tronic250r.lisp) auf dem Tronic, nicht auf dem VESC Express.
 - Eine in Signal K eingebettete Node-RED-Instanz mit `node-red-dashboard` und `@signalk/node-red-embedded`.
 - Die Kontext-Stores `memory` und `file`, zum Beispiel:
 
@@ -186,8 +216,8 @@ das passende LispBM-Script installieren und den bisherigen VESC-Tab durch
 abwarten und die Node-RED-Motorfreigabe bei Bedarf einschalten.
 
 Der Flow entspricht unverändert dem Stand
-[Tronic250Vesc, Commit 3e47ed4](https://github.com/AndreasMulzer/Tronic250Vesc/tree/3e47ed474c19cf4932be07639b2685a33636fb86).
+[Tronic250Vesc, Commit 158e0ef](https://github.com/AndreasMulzer/Tronic250Vesc/tree/158e0ef7148bc52e55932e95a71c35036aa9448c).
 Weitere Details und Quellen stehen in der
-[zugehörigen Installationsanleitung](https://github.com/AndreasMulzer/Tronic250Vesc/blob/3e47ed474c19cf4932be07639b2685a33636fb86/docs/installation.md).
+[zugehörigen Installationsanleitung](https://github.com/AndreasMulzer/Tronic250Vesc/blob/158e0ef7148bc52e55932e95a71c35036aa9448c/docs/installation.md).
 Die lokalen Softwareprüfungen belegen keine Installation, Bremskraft oder
 Regelgüte auf dem Boot.
